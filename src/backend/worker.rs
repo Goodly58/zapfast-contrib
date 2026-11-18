@@ -9785,8 +9785,6 @@ impl Worker {
         }));
     }
 
-    /// Sends a spot as a location, keeping the row locally the way a phone
-    /// does, so the bubble shows before the phone acknowledges it.
     /// Sends one of our messages that was not sent again, as it was filed:
     /// the stored message keeps its quote, mentions and preview, and its id,
     /// so a first attempt that did arrive is not delivered twice.
@@ -9800,13 +9798,7 @@ impl Worker {
         let Some(jid) = Self::jid_of(&chat) else {
             return;
         };
-        let message = self
-            .archive
-            .raw(&chat, &id)
-            .ok()
-            .flatten()
-            .and_then(|raw| wa::Message::decode_from_slice(&raw).ok());
-        let Some(message) = message else {
+        let Some((message, expiration)) = self.stored_send(&chat, &id) else {
             self.emit(Event::Error(
                 "This message cannot be sent again: send it as a new message".to_owned(),
             ));
@@ -9821,9 +9813,6 @@ impl Worker {
                 return;
             }
         }
-        // The timer it was first sent with, even if the chat's has changed
-        // since: a retry sends the message as it was.
-        let expiration = archived_expiration(&message);
         self.awaiting_ack
             .insert(id.clone(), AwaitingAck::Message(chat.clone()));
         self.emit_message(&chat, &id);
@@ -9840,6 +9829,22 @@ impl Worker {
         ));
     }
 
+    /// A message of ours as it was filed, to send again, and the timer it
+    /// was first sent with, even if the chat's has changed since: a retry
+    /// sends the message as it was.
+    fn stored_send(&self, chat: &str, id: &str) -> Option<(wa::Message, Option<u32>)> {
+        let message = self
+            .archive
+            .raw(chat, id)
+            .ok()
+            .flatten()
+            .and_then(|raw| wa::Message::decode_from_slice(&raw).ok())?;
+        let expiration = archived_expiration(&message);
+        Some((message, expiration))
+    }
+
+    /// Sends a spot as a location, keeping the row locally the way a phone
+    /// does, so the bubble shows before the phone acknowledges it.
     fn send_location(
         &mut self,
         chat: ChatId,
@@ -20830,15 +20835,32 @@ mod receipt_tests {
 
     #[test]
     fn a_retry_keeps_the_timer_the_message_was_sent_with() {
+        let (mut worker, _events, _inbox, _wa) = worker();
         let mut timed = outgoing_text("hi".into(), None, &[]);
         assert_eq!(
             apply_ephemeral_expiration(&mut timed, Some(86_400)),
             Some(86_400)
         );
-        let stored = wa::Message::decode_from_slice(&timed.encode_to_vec()).expect("decode");
-        assert_eq!(archived_expiration(&stored), Some(86_400));
         let plain = outgoing_text("hi".into(), None, &[]);
-        assert_eq!(archived_expiration(&plain), None);
+        for (id, raw) in [("timed", timed), ("plain", plain)] {
+            let failed = Message {
+                status: Delivery::Failed,
+                ..own_message(id, 1)
+            };
+            let raw = raw.encode_to_vec();
+            worker.store_message(failed, Some(raw), None);
+        }
+        // The chat's timer changes after both were sent.
+        worker.archive.ensure_chat(PEER, "Fixture").expect("chat");
+        worker
+            .archive
+            .set_ephemeral(PEER, 604_800, 2)
+            .expect("timer");
+        assert_eq!(worker.ephemeral_expiration(PEER), Some(604_800));
+
+        let timer = |id: &str| worker.stored_send(PEER, id).map(|sent| sent.1);
+        assert_eq!(timer("timed"), Some(Some(86_400)));
+        assert_eq!(timer("plain"), Some(None), "no timer is added either");
     }
 
     #[tokio::test]

@@ -200,13 +200,17 @@ mod tests {
 
     #[test]
     fn a_send_follows_its_chat_to_the_phone_number() {
-        let archive = Archive::in_memory().expect("opens");
-        archive.ensure_chat("9@lid", "Fixture").expect("chat");
-        archive
-            .insert_sending(&message("9@lid", "m", 100, true), None)
-            .expect("insert");
-        archive.put_lid("9", "1").expect("mapping");
-
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("archive.db");
+        {
+            let archive = Archive::open_with_key(&path, &[7; 32]).expect("open");
+            archive.ensure_chat("9@lid", "Fixture").expect("chat");
+            archive
+                .insert_sending(&message("9@lid", "m", 100, true), None)
+                .expect("insert");
+            archive.put_lid("9", "1").expect("mapping");
+        }
+        let archive = Archive::open_with_key(&path, &[7; 32]).expect("reopen");
         assert_eq!(archive.fail_cut_off_sends().expect("fail"), 1);
         assert_eq!(status(&archive, "1@s.whatsapp.net", "m"), Delivery::Failed);
     }
