@@ -1349,6 +1349,7 @@ impl Archive {
             params![lid_chat, phone_chat],
         )?;
         Self::move_message_metadata(&transaction, &lid_chat, &phone_chat)?;
+        Self::move_sending(&transaction, &lid_chat, &phone_chat)?;
         self.settle_duplicates(&phone_chat, copies, Reactions::Kept)?;
         transaction.execute(
             "INSERT OR IGNORE INTO polls (chat, id, creator, secret) SELECT ?2, id, creator, secret FROM polls WHERE chat = ?1",
@@ -2964,13 +2965,33 @@ impl Archive {
     /// Clears all archived data during unlinking.
     pub fn clear(&self) -> Result<()> {
         self.connection.execute_batch(
-            "DELETE FROM poll_history; DELETE FROM poll_votes; DELETE FROM polls; DELETE FROM group_receipts; DELETE FROM messages; DELETE FROM stars; DELETE FROM motion_clips; DELETE FROM chats; DELETE FROM chat_removals; DELETE FROM message_removals; DELETE FROM pending_message_removals; DELETE FROM contacts; DELETE FROM meta; DELETE FROM lids; DELETE FROM drafts; DELETE FROM local_chat_labels; DELETE FROM local_labels; DELETE FROM removed_recent_stickers; DELETE FROM favorite_stickers; DELETE FROM favorites; DELETE FROM favorite_changes;",
+            "DELETE FROM poll_history; DELETE FROM poll_votes; DELETE FROM polls; DELETE FROM group_receipts; DELETE FROM messages; DELETE FROM stars; DELETE FROM motion_clips; DELETE FROM chats; DELETE FROM chat_removals; DELETE FROM message_removals; DELETE FROM pending_message_removals; DELETE FROM contacts; DELETE FROM meta; DELETE FROM lids; DELETE FROM drafts; DELETE FROM local_chat_labels; DELETE FROM local_labels; DELETE FROM removed_recent_stickers; DELETE FROM favorite_stickers; DELETE FROM favorites; DELETE FROM favorite_changes; DELETE FROM sending;",
         )
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// Makes changing the status of message `id` fail, as a full disk would,
+    /// until [`accept_status`].
+    pub(crate) fn reject_status(archive: &super::Archive, id: &str) {
+        archive
+            .connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_status BEFORE UPDATE OF status ON messages WHEN NEW.id = '{id}'
+                 BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;"
+            ))
+            .unwrap();
+    }
+
+    /// Undoes [`reject_status`].
+    pub(crate) fn accept_status(archive: &super::Archive) {
+        archive
+            .connection
+            .execute_batch("DROP TRIGGER reject_status;")
+            .unwrap();
+    }
+
     /// Makes filing the message `id` fail, as a full disk would.
     pub(crate) fn reject_message(archive: &super::Archive, id: &str) {
         archive

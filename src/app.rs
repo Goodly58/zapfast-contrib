@@ -7413,7 +7413,8 @@ impl App {
             | Action::ReplyInteractive { chat, .. }
             | Action::CreatePoll { chat, .. }
             | Action::VotePoll { chat, .. }
-            | Action::React { chat, .. } => Some(chat.as_str()),
+            | Action::React { chat, .. }
+            | Action::Resend { chat, .. } => Some(chat.as_str()),
             Action::SendPending { account, chat, .. } if account == &self.account().id => {
                 Some(chat.as_str())
             }

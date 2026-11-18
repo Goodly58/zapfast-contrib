@@ -61,6 +61,17 @@ impl Archive {
         Ok(failed)
     }
 
+    /// Moves the notes of a chat's running sends to the chat its messages
+    /// moved to, within that move's transaction.
+    pub(super) fn move_sending(transaction: &Batch<'_>, source: &str, target: &str) -> Result<()> {
+        transaction.execute(
+            "INSERT OR IGNORE INTO sending (chat, id) SELECT ?2, id FROM sending WHERE chat = ?1",
+            params![source, target],
+        )?;
+        transaction.execute("DELETE FROM sending WHERE chat = ?1", params![source])?;
+        Ok(())
+    }
+
     /// Readies one of our messages that was not sent for another send: it is
     /// pending again and noted as sending. A group's members that never
     /// received it are dropped, so the new send's audience replaces them.
@@ -180,6 +191,35 @@ mod tests {
             Delivery::Failed,
             "the retry is noted as a running send"
         );
+    }
+
+    #[test]
+    fn a_send_follows_its_chat_to_the_phone_number() {
+        let archive = Archive::in_memory().expect("opens");
+        archive.ensure_chat("9@lid", "Fixture").expect("chat");
+        archive
+            .insert_message(&message("9@lid", "m", 100, true), None)
+            .expect("insert");
+        archive.note_sending("9@lid", "m").expect("note");
+        archive.put_lid("9", "1").expect("mapping");
+
+        assert_eq!(archive.fail_cut_off_sends().expect("fail"), 1);
+        assert_eq!(status(&archive, "1@s.whatsapp.net", "m"), Delivery::Failed);
+    }
+
+    #[test]
+    fn unlinking_forgets_running_sends() {
+        let archive = Archive::in_memory().expect("opens");
+        archive
+            .insert_message(&message(GROUP, "m", 100, true), None)
+            .expect("insert");
+        archive.note_sending(GROUP, "m").expect("note");
+        archive.clear().expect("clear");
+        let left: i64 = archive
+            .connection
+            .query_row("SELECT COUNT(*) FROM sending", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(left, 0);
     }
 
     #[test]

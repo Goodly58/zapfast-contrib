@@ -7293,7 +7293,8 @@ impl Worker {
             | Command::SendSticker { chat, .. }
             | Command::SendGif { chat, .. }
             | Command::SendLocation { chat, .. }
-            | Command::CreatePoll { chat, .. } => Some(chat),
+            | Command::CreatePoll { chat, .. }
+            | Command::Resend { chat, .. } => Some(chat),
             // A batch goes to every recipient or to none of them.
             Command::Forward { to_chats, .. } => to_chats
                 .iter()
@@ -9074,10 +9075,15 @@ impl Worker {
                     // A failed send is never acked; a retry stores the row again.
                     self.awaiting_ack.remove(&id);
                 }
-                let _ = self
+                // The note goes only once the outcome is filed: a message
+                // left pending without it would never be offered again.
+                if self
                     .archive
-                    .set_status(&chat, &id, status, crate::util::now());
-                let _ = self.archive.sending_finished(&chat, &id);
+                    .set_status(&chat, &id, status, crate::util::now())
+                    .is_ok()
+                {
+                    let _ = self.archive.sending_finished(&chat, &id);
+                }
                 self.emit_message(&chat, &id);
                 self.emit_chat(&chat);
                 self.advance_serial_forward(&id);
@@ -9792,7 +9798,7 @@ impl Worker {
             .ok()
             .flatten()
             .and_then(|raw| wa::Message::decode_from_slice(&raw).ok());
-        let Some(mut message) = message else {
+        let Some(message) = message else {
             self.emit(Event::Error(
                 "This message cannot be sent again: send it as a new message".to_owned(),
             ));
@@ -9807,7 +9813,9 @@ impl Worker {
                 return;
             }
         }
-        let expiration = self.apply_ephemeral(&chat, &mut message);
+        // The timer it was first sent with, even if the chat's has changed
+        // since: a retry sends the message as it was.
+        let expiration = archived_expiration(&message);
         self.awaiting_ack
             .insert(id.clone(), AwaitingAck::Message(chat.clone()));
         self.emit_message(&chat, &id);
@@ -12337,6 +12345,13 @@ fn apply_ephemeral_expiration(message: &mut wa::Message, expiration: Option<u32>
     message
         .set_ephemeral_expiration(expiration)
         .then_some(expiration)
+}
+
+/// The disappearing timer a stored message of ours was sent with.
+fn archived_expiration(message: &wa::Message) -> Option<u32> {
+    message
+        .get_ephemeral_expiration()
+        .filter(|expiration| *expiration > 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20731,8 +20746,72 @@ mod receipt_tests {
     }
 
     #[tokio::test]
+    async fn a_send_whose_outcome_was_not_filed_stays_noted() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let pending = Message {
+            status: Delivery::Pending,
+            ..own_message("m", 1)
+        };
+        worker.store_message(pending, None, None);
+        crate::archive::tests::reject_status(&worker.archive, "m");
+        worker
+            .handle_command(Command::Sent {
+                chat: PEER.into(),
+                id: "m".into(),
+                error: None,
+            })
+            .await;
+        crate::archive::tests::accept_status(&worker.archive);
+
+        assert_eq!(
+            worker.archive.fail_cut_off_sends().expect("cut off"),
+            1,
+            "a message still pending is offered again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_to_a_blocked_contact_is_refused() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        worker.privacy_ready = true;
+        worker.blocklist.ids = Some([PEER.into()].into());
+        let failed = Message {
+            status: Delivery::Failed,
+            ..own_message("m", 1)
+        };
+        let raw = outgoing_text("hi".into(), None, &[]).encode_to_vec();
+        worker.store_message(failed, Some(raw), None);
+        while events.try_recv().is_ok() {}
+
+        worker
+            .handle_command(Command::Resend {
+                chat: PEER.into(),
+                id: "m".into(),
+            })
+            .await;
+
+        assert_eq!(own_status(&worker, "m"), Delivery::Failed);
+        assert!(
+            events.try_iter().any(
+                |event| matches!(event, Event::Error(error) if error.contains("Unblock"))
+            )
+        );
+    }
+
+    #[test]
+    fn a_retry_keeps_the_timer_the_message_was_sent_with() {
+        let mut timed = outgoing_text("hi".into(), None, &[]);
+        assert_eq!(apply_ephemeral_expiration(&mut timed, Some(86_400)), Some(86_400));
+        let stored = wa::Message::decode_from_slice(&timed.encode_to_vec()).expect("decode");
+        assert_eq!(archived_expiration(&stored), Some(86_400));
+        let plain = outgoing_text("hi".into(), None, &[]);
+        assert_eq!(archived_expiration(&plain), None);
+    }
+
+    #[tokio::test]
     async fn a_retry_while_offline_keeps_the_message_not_sent() {
         let (mut worker, events, _inbox, _wa) = worker();
+        worker.privacy_ready = true;
         let failed = Message {
             status: Delivery::Failed,
             ..own_message("m", 1)

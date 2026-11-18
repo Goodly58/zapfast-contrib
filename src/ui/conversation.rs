@@ -5691,7 +5691,8 @@ fn bubble_frame(
                 }
             };
             if over_picture && let Some(picture) = slot {
-                footer_over_picture(ui, view, message, picture, starred, pinned, actions);
+                let menu = not_sent_menu_id(&message.chat, &message.id);
+                footer_over_picture(ui, view, message, picture, starred, pinned, menu, actions);
             } else {
                 footer(ui, view, last, slot, starred, pinned, actions);
             }
@@ -6561,6 +6562,8 @@ const OVER_PICTURE_INSET: Vec2 = vec2(10.0, 6.0);
 
 /// Paints the time and ticks over the bottom corner of a picture without a
 /// caption, in white on a soft dark scrim so they read on any picture.
+/// `menu` is the popup a "Not sent" label opens.
+#[allow(clippy::too_many_arguments)]
 fn footer_over_picture(
     ui: &mut egui::Ui,
     view: &View<'_>,
@@ -6568,6 +6571,7 @@ fn footer_over_picture(
     picture: Rect,
     starred: bool,
     pinned: bool,
+    menu: egui::Id,
     actions: &mut Vec<Action>,
 ) {
     let palette = &view.palette;
@@ -6626,7 +6630,7 @@ fn footer_over_picture(
             failed.size(),
         );
         ui.painter().galley(label.min, failed, Color32::WHITE);
-        not_sent_menu(ui, view, message, label, actions);
+        not_sent_menu(ui, view, message, label, menu, actions);
     }
     if pinned {
         x -= FOOTER_MARK_SLOT;
@@ -6707,7 +6711,8 @@ fn not_sent(message: &Message) -> bool {
     message.from_me && message.status == Delivery::Failed
 }
 
-/// The popup a not-sent message's label opens.
+/// The popup a not-sent message's label opens in its bubble's footer. An
+/// album's tile has its own, since the album's last message shows both.
 pub(crate) fn not_sent_menu_id(chat: &str, id: &str) -> egui::Id {
     egui::Id::new(("not-sent-menu", chat, id))
 }
@@ -6721,21 +6726,18 @@ fn not_sent_menu(
     view: &View<'_>,
     message: &Message,
     label: Rect,
+    menu: egui::Id,
     actions: &mut Vec<Action>,
 ) {
     let response = ui
-        .interact(
-            label,
-            ui.id().with(("not-sent-menu", &message.id)),
-            Sense::click(),
-        )
+        .interact(label, menu.with("label"), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     response
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, NOT_SENT_HINT));
     let response = response.on_hover_text(NOT_SENT_HINT);
     let palette = &view.palette;
     egui::Popup::menu(&response)
-        .id(not_sent_menu_id(&message.chat, &message.id))
+        .id(menu)
         .frame(widgets::menu_frame(palette))
         .show(|ui| {
             if widgets::menu_item(
@@ -6853,7 +6855,8 @@ fn footer(
             failed.size(),
         );
         ui.painter().galley(label.min, failed, palette.text);
-        not_sent_menu(ui, view, message, label, actions);
+        let menu = not_sent_menu_id(&message.chat, &message.id);
+        not_sent_menu(ui, view, message, label, menu, actions);
     }
     if starred {
         x -= FOOTER_MARK_SLOT;
@@ -7059,6 +7062,7 @@ pub(crate) fn menu_width(
 fn message_menu_labels(locale: crate::i18n::Locale) -> Vec<String> {
     use crate::i18n::gettext;
     [
+        gettext(locale, "Retry"),
         gettext(locale, "Reply"),
         gettext(locale, "Reply privately"),
         gettext(locale, "Star"),
@@ -7387,6 +7391,13 @@ fn context_menu(
         first.get_or_insert(response.id);
         response.clicked()
     };
+    // What the "Not sent" label offers, here too for the keyboard.
+    if not_sent(message) && item(ui, Icon::Refresh, &crate::i18n::gettext(view.locale, "Retry")) {
+        actions.push(Action::Resend {
+            chat: chat.clone(),
+            id: message.id.clone(),
+        });
+    }
     if can_reply(&message.content)
         && item(ui, Icon::Reply, &crate::i18n::gettext(view.locale, "Reply"))
     {
@@ -9159,7 +9170,8 @@ fn album_tile(
         if not_sent(message) {
             let starred = view.starred.is_some_and(|ids| ids.contains(&message.id));
             let pinned = view.pins.is_some_and(|ids| ids.contains(&message.id));
-            footer_over_picture(ui, view, message, rect, starred, pinned, actions);
+            let menu = not_sent_menu_id(&message.chat, &message.id).with("album-tile");
+            footer_over_picture(ui, view, message, rect, starred, pinned, menu, actions);
         }
     }
     // A motion photo in an album keeps its own badge and clip.
@@ -12945,6 +12957,7 @@ mod tests {
                             picture,
                             starred,
                             pinned,
+                            not_sent_menu_id(&message.chat, &message.id),
                             &mut Vec::new(),
                         );
                     },
