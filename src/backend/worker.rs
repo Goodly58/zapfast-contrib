@@ -9085,6 +9085,19 @@ impl Worker {
                     }
                     return;
                 }
+                // A phone number learned during the send moved the message,
+                // and the note of its send, out of the privacy id's chat.
+                let chat = self.canonical_str(&chat);
+                let error = match error {
+                    // The server acknowledged the message, so it went out: it
+                    // is not marked not sent, as a retry would only move it
+                    // down the chat.
+                    Some(error) if self.went_out(&chat, &id) => {
+                        log::warn!("an acknowledged message reported an error: {error}");
+                        None
+                    }
+                    error => error,
+                };
                 let status = match &error {
                     Some(_) => Delivery::Failed,
                     None => Delivery::Sent,
@@ -9093,9 +9106,6 @@ impl Worker {
                     // A failed send is never acked; a retry stores the row again.
                     self.awaiting_ack.remove(&id);
                 }
-                // A phone number learned during the send moved the message,
-                // and the note of its send, out of the privacy id's chat.
-                let chat = self.canonical_str(&chat);
                 // The note goes only once the outcome is filed: a message
                 // left pending without it would never be offered again.
                 if self
@@ -9840,6 +9850,14 @@ impl Worker {
             expiration,
             None,
         ));
+    }
+
+    /// Whether the server acknowledged a message of ours, or a receipt or a
+    /// copy that was sent showed it went out.
+    fn went_out(&self, chat: &str, id: &str) -> bool {
+        let went_out = Delivery::Sent..Delivery::Failed;
+        let stored = self.archive.message(chat, id).ok().flatten();
+        stored.is_some_and(|stored| went_out.contains(&stored.status))
     }
 
     /// A message of ours as it was filed, to send again, and the timer it
@@ -24184,6 +24202,32 @@ mod receipt_tests {
         assert_eq!(own_status(&worker, "mine"), Delivery::Sent);
         // A quit before the send reports leaves nothing to mark not sent.
         assert_eq!(worker.archive.fail_cut_off_sends().expect("cut off"), 0);
+    }
+
+    #[tokio::test]
+    async fn an_error_after_the_server_ack_leaves_the_message_sent() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let pending = Message {
+            status: Delivery::Pending,
+            ..own_message("mine", 200)
+        };
+        worker.store_message(pending, None, None);
+        let timed = wa_events::ServerAck::builder()
+            .id("mine".to_owned())
+            .class("message".to_owned())
+            .timestamp(whatsapp_rust::wacore::time::from_secs(140).unwrap())
+            .build();
+        worker.server_ack(&timed);
+        worker
+            .handle_command(Command::Sent {
+                chat: PEER.into(),
+                id: "mine".into(),
+                error: Some("timed out".into()),
+            })
+            .await;
+
+        // It went out, so it offers no Retry that would move it again.
+        assert_eq!(own_status(&worker, "mine"), Delivery::Sent);
     }
 
     #[test]
