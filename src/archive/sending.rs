@@ -9,7 +9,7 @@
 use rusqlite::{OptionalExtension, params};
 
 use super::{Archive, Batch, Result, status_rank};
-use crate::model::Delivery;
+use crate::model::{Delivery, Message};
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sending (
@@ -20,13 +20,17 @@ CREATE TABLE IF NOT EXISTS sending (
 ";
 
 impl Archive {
-    /// Notes that a send of this message of ours is running.
-    pub fn note_sending(&self, chat: &str, id: &str) -> Result<()> {
-        self.connection.execute(
+    /// Stores a message of ours that is about to be sent, noting its send as
+    /// running. Both go in one write: a quit between two would leave the
+    /// message pending with no note, never to be offered again.
+    pub fn insert_sending(&self, message: &Message, raw: Option<&[u8]>) -> Result<()> {
+        let transaction = Batch::begin(&self.connection)?;
+        self.insert_message(message, raw)?;
+        transaction.execute(
             "INSERT OR IGNORE INTO sending (chat, id) VALUES (?1, ?2)",
-            params![chat, id],
+            params![message.chat, message.id],
         )?;
-        Ok(())
+        transaction.commit()
     }
 
     /// Forgets a send once it has finished, sent or failed.
@@ -128,13 +132,14 @@ mod tests {
         let path = dir.path().join("archive.db");
         {
             let archive = Archive::open_with_key(&path, &[7; 32]).expect("open");
-            for id in ["cut", "finished", "theirs"] {
+            for id in ["cut", "finished"] {
                 archive
-                    .insert_message(&message(GROUP, id, 100, true), None)
+                    .insert_sending(&message(GROUP, id, 100, true), None)
                     .expect("insert");
             }
-            archive.note_sending(GROUP, "cut").expect("note");
-            archive.note_sending(GROUP, "finished").expect("note");
+            archive
+                .insert_message(&message(GROUP, "theirs", 100, true), None)
+                .expect("insert");
             archive
                 .set_status(GROUP, "finished", Delivery::Sent, 101)
                 .expect("sent");
@@ -198,9 +203,8 @@ mod tests {
         let archive = Archive::in_memory().expect("opens");
         archive.ensure_chat("9@lid", "Fixture").expect("chat");
         archive
-            .insert_message(&message("9@lid", "m", 100, true), None)
+            .insert_sending(&message("9@lid", "m", 100, true), None)
             .expect("insert");
-        archive.note_sending("9@lid", "m").expect("note");
         archive.put_lid("9", "1").expect("mapping");
 
         assert_eq!(archive.fail_cut_off_sends().expect("fail"), 1);
@@ -211,15 +215,67 @@ mod tests {
     fn unlinking_forgets_running_sends() {
         let archive = Archive::in_memory().expect("opens");
         archive
-            .insert_message(&message(GROUP, "m", 100, true), None)
+            .insert_sending(&message(GROUP, "m", 100, true), None)
             .expect("insert");
-        archive.note_sending(GROUP, "m").expect("note");
         archive.clear().expect("clear");
         let left: i64 = archive
             .connection
             .query_row("SELECT COUNT(*) FROM sending", [], |row| row.get(0))
             .expect("count");
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn a_send_is_stored_with_its_note_or_not_at_all() {
+        let archive = Archive::in_memory().expect("opens");
+        archive
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_note BEFORE INSERT ON sending
+                 BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+            )
+            .expect("trigger");
+        assert!(
+            archive
+                .insert_sending(&message(GROUP, "m", 100, true), None)
+                .is_err()
+        );
+        assert!(archive.message(GROUP, "m").expect("read").is_none());
+    }
+
+    #[test]
+    fn a_confirmed_copy_lifts_a_send_cut_off() {
+        let archive = Archive::in_memory().expect("opens");
+        let mut copy = message(GROUP, "m", 100, true);
+        archive.insert_sending(&copy, None).expect("insert");
+        archive.fail_cut_off_sends().expect("fail");
+        archive.insert_message(&copy, None).expect("pending copy");
+        assert_eq!(
+            status(&archive, GROUP, "m"),
+            Delivery::Failed,
+            "a pending copy proves nothing"
+        );
+        copy.status = Delivery::Delivered;
+        archive.insert_message(&copy, None).expect("delivered copy");
+        assert_eq!(status(&archive, GROUP, "m"), Delivery::Delivered);
+    }
+
+    #[test]
+    fn merged_copies_keep_the_one_that_was_sent() {
+        for (lid, phone) in [
+            (Delivery::Failed, Delivery::Sent),
+            (Delivery::Sent, Delivery::Failed),
+        ] {
+            let archive = Archive::in_memory().expect("opens");
+            for (chat, state) in [("9@lid", lid), ("1@s.whatsapp.net", phone)] {
+                archive.ensure_chat(chat, "Fixture").expect("chat");
+                let mut copy = message(chat, "m", 100, true);
+                copy.status = state;
+                archive.insert_message(&copy, None).expect("insert");
+            }
+            archive.put_lid("9", "1").expect("mapping");
+            assert_eq!(status(&archive, "1@s.whatsapp.net", "m"), Delivery::Sent);
+        }
     }
 
     #[test]

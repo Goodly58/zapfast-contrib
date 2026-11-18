@@ -6067,19 +6067,24 @@ impl Worker {
             message.content.keep_local_paths(&existing.content);
             keep_live_location_notice(&mut message.content, existing);
         }
-        if let Err(error) = self.archive.insert_message(&message, raw.as_deref()) {
+        // A message of ours about to be sent is stored with a note of its
+        // send, so one cut off can be offered again.
+        let sending = message.from_me && message.status == Delivery::Pending;
+        let stored = if sending {
+            self.archive.insert_sending(&message, raw.as_deref())
+        } else {
+            self.archive.insert_message(&message, raw.as_deref())
+        };
+        if let Err(error) = stored {
             log::warn!("could not store a message: {error}");
             return;
         }
         // Only a stored message can be moved to the server's time.
-        if message.from_me && message.status == Delivery::Pending {
+        if sending {
             self.awaiting_ack.insert(
                 message.id.clone(),
                 AwaitingAck::Message(message.chat.clone()),
             );
-            if let Err(error) = self.archive.note_sending(&message.chat, &message.id) {
-                log::warn!("could not note a running send: {error}");
-            }
         }
         self.retire_local_call_twins(&message);
         if existing
@@ -9075,6 +9080,9 @@ impl Worker {
                     // A failed send is never acked; a retry stores the row again.
                     self.awaiting_ack.remove(&id);
                 }
+                // A phone number learned during the send moved the message,
+                // and the note of its send, out of the privacy id's chat.
+                let chat = self.canonical_str(&chat);
                 // The note goes only once the outcome is filed: a message
                 // left pending without it would never be offered again.
                 if self
@@ -20743,6 +20751,28 @@ mod receipt_tests {
         assert_eq!(worker.archive.fail_cut_off_sends().expect("cut off"), 1);
         assert_eq!(own_status(&worker, "cut"), Delivery::Failed);
         assert_eq!(own_status(&worker, "done"), Delivery::Sent);
+    }
+
+    #[tokio::test]
+    async fn a_send_reports_after_its_chat_moved_to_the_phone_number() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let pending = Message {
+            chat: PEER_LID.into(),
+            status: Delivery::Pending,
+            ..own_message("m", 1)
+        };
+        worker.store_message(pending, None, None);
+        worker.learn_lid("167650256810092", "4917663430455");
+        worker
+            .handle_command(Command::Sent {
+                chat: PEER_LID.into(),
+                id: "m".into(),
+                error: None,
+            })
+            .await;
+
+        assert_eq!(own_status(&worker, "m"), Delivery::Sent);
+        assert_eq!(worker.archive.fail_cut_off_sends().expect("cut off"), 0);
     }
 
     #[tokio::test]

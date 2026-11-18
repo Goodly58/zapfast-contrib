@@ -1325,6 +1325,8 @@ impl Archive {
             params![lid_chat, phone_chat],
         )?;
         let copies = self.duplicate_copies(&lid_chat, &phone_chat)?;
+        // Of two copies of a message, a failed one gives way to one that was
+        // sent.
         transaction.execute(
             "INSERT INTO messages (chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at, history_order, broadcast_list)
              SELECT ?2, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at, history_order, broadcast_list
@@ -1333,7 +1335,11 @@ impl Archive {
              ON CONFLICT(chat, id) DO UPDATE SET
                 content = CASE WHEN excluded.edited > messages.edited THEN excluded.content ELSE messages.content END,
                 sender_name = COALESCE(messages.sender_name, excluded.sender_name),
-                status = MAX(messages.status, excluded.status),
+                status = CASE
+                    WHEN messages.status = ?3 AND excluded.status >= ?4 THEN excluded.status
+                    WHEN excluded.status = ?3 AND messages.status >= ?4 THEN messages.status
+                    ELSE MAX(messages.status, excluded.status)
+                END,
                 quoted = COALESCE(messages.quoted, excluded.quoted),
                 reactions = CASE WHEN messages.reactions = '[]' THEN excluded.reactions ELSE messages.reactions END,
                 edited = MAX(messages.edited, excluded.edited),
@@ -1346,7 +1352,12 @@ impl Archive {
                 read_at = COALESCE(messages.read_at, excluded.read_at),
                 history_order = COALESCE(messages.history_order, excluded.history_order),
                 broadcast_list = COALESCE(messages.broadcast_list, excluded.broadcast_list)",
-            params![lid_chat, phone_chat],
+            params![
+                lid_chat,
+                phone_chat,
+                status_rank(Delivery::Failed),
+                status_rank(Delivery::Sent)
+            ],
         )?;
         Self::move_message_metadata(&transaction, &lid_chat, &phone_chat)?;
         Self::move_sending(&transaction, &lid_chat, &phone_chat)?;
@@ -1658,6 +1669,7 @@ impl Archive {
                 sender_name = COALESCE(excluded.sender_name, sender_name),
                 content = excluded.content,
                 status = CASE
+                    WHEN messages.status = ?18 AND excluded.status >= ?20 THEN excluded.status
                     WHEN messages.status > excluded.status AND excluded.status <> ?18
                     THEN messages.status
                     ELSE excluded.status
@@ -1698,6 +1710,8 @@ impl Archive {
                 // An explicit failure still writes over a further state.
                 status_rank(Delivery::Failed),
                 message.history_order,
+                // A copy that was sent moves a failed message on.
+                status_rank(Delivery::Sent),
             ],
         )?;
         if matches!(message.content, Content::Image { motion: None, .. }) {

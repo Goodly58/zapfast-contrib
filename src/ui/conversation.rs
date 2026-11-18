@@ -13477,10 +13477,6 @@ mod reaction_tests {
         own.from_me = true;
         own.timestamp = crate::util::now();
         own.status = Delivery::Delivered;
-        let mut failed = with_reactions(Vec::new());
-        failed.from_me = true;
-        failed.timestamp = crate::util::now();
-        failed.status = Delivery::Failed;
         let path = Some(file.to_path_buf());
         let media = |mime: &str, path: Option<PathBuf>, state| Media {
             mime: mime.into(),
@@ -13512,11 +13508,6 @@ mod reaction_tests {
                 message: own,
                 marks: Marks { starred: true },
                 pinned: true,
-            },
-            MenuRow {
-                message: failed,
-                marks: Marks { starred: false },
-                pinned: false,
             },
             photo(path.clone(), Idle),
             photo(None, Idle),
@@ -13575,8 +13566,19 @@ mod reaction_tests {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("photo.jpg");
         std::fs::write(&file, b"jpeg").unwrap();
+        // A message of ours that was not sent also offers Retry. It stays out
+        // of the shared fixtures until the catalogs translate it.
+        let mut failed = with_reactions(Vec::new());
+        failed.from_me = true;
+        failed.status = Delivery::Failed;
+        let failed = MenuRow {
+            message: failed,
+            marks: Marks { starred: false },
+            pinned: false,
+        };
         let mut labels: Vec<String> = menu_fixtures(&file)
             .iter()
+            .chain([&failed])
             .flat_map(|row| drawn_menu_words(crate::i18n::Locale::English, row))
             .collect();
         // The menu is as wide as the longest label it measures. The
