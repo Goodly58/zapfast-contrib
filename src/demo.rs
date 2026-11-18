@@ -20710,6 +20710,11 @@ mod tests {
             nodes.iter().any(|(label, _, _)| label == "Cancel"),
             "{nodes:?}"
         );
+        // As wide as its two labels need, not as wide as the chat.
+        let area = ctx
+            .memory(|memory| memory.area_rect(menu))
+            .expect("the menu is shown");
+        assert!(area.width() < 200.0, "{area:?}");
         let retry = nodes
             .iter()
             .find(|(label, _, _)| label == "Retry")

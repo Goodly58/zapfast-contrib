@@ -6736,27 +6736,20 @@ fn not_sent_menu(
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, NOT_SENT_HINT));
     let response = response.on_hover_text(NOT_SENT_HINT);
     let palette = &view.palette;
+    let retry = crate::i18n::gettext(view.locale, "Retry");
+    let cancel = crate::i18n::gettext(view.locale, "Cancel");
     egui::Popup::menu(&response)
         .id(menu)
+        .width(widgets::menu_width(ui, &[&*retry, &*cancel], true))
         .frame(widgets::menu_frame(palette))
         .show(|ui| {
-            if widgets::menu_item(
-                ui,
-                palette,
-                Some(Icon::Refresh),
-                &crate::i18n::gettext(view.locale, "Retry"),
-            ) {
+            if widgets::menu_item(ui, palette, Some(Icon::Refresh), &retry) {
                 actions.push(Action::Resend {
                     chat: message.chat.clone(),
                     id: message.id.clone(),
                 });
             }
-            if widgets::menu_item(
-                ui,
-                palette,
-                Some(Icon::X),
-                &crate::i18n::gettext(view.locale, "Cancel"),
-            ) {
+            if widgets::menu_item(ui, palette, Some(Icon::X), &cancel) {
                 actions.push(delete_for_me_action(&message.chat, &message.id));
             }
         });
