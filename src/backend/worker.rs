@@ -20792,16 +20792,19 @@ mod receipt_tests {
 
         assert_eq!(own_status(&worker, "m"), Delivery::Failed);
         assert!(
-            events.try_iter().any(
-                |event| matches!(event, Event::Error(error) if error.contains("Unblock"))
-            )
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Error(error) if error.contains("Unblock")))
         );
     }
 
     #[test]
     fn a_retry_keeps_the_timer_the_message_was_sent_with() {
         let mut timed = outgoing_text("hi".into(), None, &[]);
-        assert_eq!(apply_ephemeral_expiration(&mut timed, Some(86_400)), Some(86_400));
+        assert_eq!(
+            apply_ephemeral_expiration(&mut timed, Some(86_400)),
+            Some(86_400)
+        );
         let stored = wa::Message::decode_from_slice(&timed.encode_to_vec()).expect("decode");
         assert_eq!(archived_expiration(&stored), Some(86_400));
         let plain = outgoing_text("hi".into(), None, &[]);

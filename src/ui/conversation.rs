@@ -7392,7 +7392,13 @@ fn context_menu(
         response.clicked()
     };
     // What the "Not sent" label offers, here too for the keyboard.
-    if not_sent(message) && item(ui, Icon::Refresh, &crate::i18n::gettext(view.locale, "Retry")) {
+    if not_sent(message)
+        && item(
+            ui,
+            Icon::Refresh,
+            &crate::i18n::gettext(view.locale, "Retry"),
+        )
+    {
         actions.push(Action::Resend {
             chat: chat.clone(),
             id: message.id.clone(),
@@ -13478,6 +13484,10 @@ mod reaction_tests {
         own.from_me = true;
         own.timestamp = crate::util::now();
         own.status = Delivery::Delivered;
+        let mut failed = with_reactions(Vec::new());
+        failed.from_me = true;
+        failed.timestamp = crate::util::now();
+        failed.status = Delivery::Failed;
         let path = Some(file.to_path_buf());
         let media = |mime: &str, path: Option<PathBuf>, state| Media {
             mime: mime.into(),
@@ -13509,6 +13519,11 @@ mod reaction_tests {
                 message: own,
                 marks: Marks { starred: true },
                 pinned: true,
+            },
+            MenuRow {
+                message: failed,
+                marks: Marks { starred: false },
+                pinned: false,
             },
             photo(path.clone(), Idle),
             photo(None, Idle),

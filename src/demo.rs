@@ -20695,19 +20695,32 @@ mod tests {
             })
             .expect("the Not sent label is a button")
             .2;
-        frame_sized(&mut app, &ctx, 780.0, vec![egui::Event::PointerMoved(label)]);
+        frame_sized(
+            &mut app,
+            &ctx,
+            780.0,
+            vec![egui::Event::PointerMoved(label)],
+        );
         frame_sized(&mut app, &ctx, 780.0, vec![primary(label, true)]);
         frame_sized(&mut app, &ctx, 780.0, vec![primary(label, false)]);
         assert!(egui::Popup::is_id_open(&ctx, menu));
 
         let nodes = accessible_nodes(&mut app, &ctx, vec![]);
-        assert!(nodes.iter().any(|(label, _, _)| label == "Cancel"), "{nodes:?}");
+        assert!(
+            nodes.iter().any(|(label, _, _)| label == "Cancel"),
+            "{nodes:?}"
+        );
         let retry = nodes
             .iter()
             .find(|(label, _, _)| label == "Retry")
             .expect("Retry")
             .2;
-        frame_sized(&mut app, &ctx, 780.0, vec![egui::Event::PointerMoved(retry)]);
+        frame_sized(
+            &mut app,
+            &ctx,
+            780.0,
+            vec![egui::Event::PointerMoved(retry)],
+        );
         frame_sized(&mut app, &ctx, 780.0, vec![primary(retry, true)]);
         frame_sized(&mut app, &ctx, 780.0, vec![primary(retry, false)]);
         assert!(
