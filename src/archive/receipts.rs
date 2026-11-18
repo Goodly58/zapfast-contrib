@@ -130,7 +130,21 @@ impl Archive {
         )?;
         let aggregate = status_from_rank(rank.unwrap_or(0));
         let now = crate::util::now();
-        let mut changed = false;
+        // One member's receipt proves a message marked not sent went out,
+        // though its ticks wait for the least advanced member.
+        let lifted = transaction.execute(
+            "UPDATE messages SET status = ?3 WHERE chat = ?1 AND id = ?2 AND status = ?4
+             AND EXISTS (SELECT 1 FROM group_receipts
+                 WHERE chat = ?1 AND id = ?2 AND status >= ?5)",
+            params![
+                chat,
+                id,
+                status_rank(Delivery::Sent),
+                status_rank(Delivery::Failed),
+                status_rank(Delivery::Delivered)
+            ],
+        )?;
+        let mut changed = lifted > 0;
         if aggregate >= Delivery::Delivered {
             changed |=
                 self.set_status(chat, id, Delivery::Delivered, delivered_at.unwrap_or(now))?;
@@ -493,6 +507,27 @@ mod tests {
             archive.message(group, "early").unwrap().unwrap().status,
             Delivery::Read
         );
+    }
+
+    #[test]
+    fn one_members_receipt_shows_a_group_message_marked_not_sent_went_out() {
+        let archive = Archive::in_memory().unwrap();
+        let chat = "120363000000000001@g.us";
+        let (a, b) = ("a@s.whatsapp.net", "b@s.whatsapp.net");
+        let mut row = super::super::tests::message(chat, "m", 100, true);
+        row.status = Delivery::Failed;
+        archive.insert_message(&row, None).unwrap();
+        archive
+            .snapshot_group_recipients(chat, "m", &[a.into(), b.into()])
+            .unwrap();
+        let status = || archive.message(chat, "m").unwrap().unwrap().status;
+        let delivered = Delivery::Delivered;
+
+        let changed = archive.group_receipt(chat, "m", a, delivered, 1);
+        assert!(changed.unwrap(), "the transcript is told");
+        assert_eq!(status(), Delivery::Sent, "the ticks wait for b");
+        archive.group_receipt(chat, "m", b, delivered, 2).unwrap();
+        assert_eq!(status(), Delivery::Delivered);
     }
 
     #[test]

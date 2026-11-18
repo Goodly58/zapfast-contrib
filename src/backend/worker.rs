@@ -2442,8 +2442,18 @@ impl Worker {
         match self.archive.restamp_sent(&chat, &ack.id, at.timestamp()) {
             Ok(changed) => {
                 self.awaiting_ack.remove(&ack.id);
-                if changed {
+                // The server has the message: a quit before its send reports
+                // must not mark it not sent at the next start.
+                let filed = self
+                    .archive
+                    .set_status(&chat, &ack.id, Delivery::Sent, at.timestamp());
+                if filed.is_ok() {
+                    let _ = self.archive.sending_finished(&chat, &ack.id);
+                }
+                if changed || filed.unwrap_or(false) {
                     self.emit_message(&chat, &ack.id);
+                }
+                if changed {
                     self.emit_chat(&chat);
                 }
             }
@@ -6678,10 +6688,13 @@ impl Worker {
                 let existing = self.archive.message(&id, &row.id).ok().flatten();
                 // A transcript already on screen is not paged again, so a
                 // status history moves forward, such as a voice message the
-                // phone played, is sent to it.
-                let status_advanced = existing
-                    .as_ref()
-                    .is_some_and(|existing| existing.status < row.status);
+                // phone played, is sent to it. A copy that was sent moves a
+                // message marked not sent on too, as the archive files it.
+                let status_advanced = existing.as_ref().is_some_and(|existing| {
+                    existing.status < row.status
+                        || (existing.status == Delivery::Failed
+                            && (Delivery::Sent..Delivery::Failed).contains(&row.status))
+                });
                 // What the info panel listed for this row before it lands,
                 // so a change to its pictures, documents or links is told.
                 let before = existing.as_ref().map(|existing| existing.content.clone());
@@ -22867,6 +22880,34 @@ mod receipt_tests {
     }
 
     #[test]
+    fn history_tells_the_transcript_a_message_marked_not_sent_went_out() {
+        use wa::web_message_info::Status;
+        let (mut worker, events, _inbox, _wa) = worker();
+        let failed = Message {
+            status: Delivery::Failed,
+            ..own_message("m", 100)
+        };
+        worker.store_message(failed, None, None);
+        while events.try_recv().is_ok() {}
+        let mut entry = history_entry(
+            PEER,
+            "m",
+            true,
+            None,
+            wa::Message::text("hi"),
+            Vec::new(),
+            None,
+        );
+        entry.message.as_option_mut().unwrap().status = Some(Status::SERVER_ACK);
+        file_history_entries(&mut worker, vec![entry]);
+        let told = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(event, Event::MessageUpdated(message)
+                if message.id == "m" && message.status == Delivery::Sent)
+        });
+        assert!(told, "the transcript still shows it not sent");
+    }
+
+    #[test]
     fn history_receipts_date_direct_ticks_and_fill_group_message_info() {
         use wa::web_message_info::Status;
         let conversation = |chat: &str, status| {
@@ -24121,6 +24162,28 @@ mod receipt_tests {
                 .timestamp,
             140
         );
+    }
+
+    #[test]
+    fn a_server_ack_files_the_send_before_it_reports() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        worker.store_message(
+            Message {
+                status: Delivery::Pending,
+                ..own_message("mine", 200)
+            },
+            None,
+            None,
+        );
+        let timed = wa_events::ServerAck::builder()
+            .id("mine".to_owned())
+            .class("message".to_owned())
+            .timestamp(whatsapp_rust::wacore::time::from_secs(140).unwrap())
+            .build();
+        worker.server_ack(&timed);
+        assert_eq!(own_status(&worker, "mine"), Delivery::Sent);
+        // A quit before the send reports leaves nothing to mark not sent.
+        assert_eq!(worker.archive.fail_cut_off_sends().expect("cut off"), 0);
     }
 
     #[test]
