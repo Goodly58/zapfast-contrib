@@ -416,6 +416,11 @@ fn run() -> eframe::Result<()> {
         .demo_page
         .as_deref()
         .is_some_and(|page| page.split(',').any(|part| part.trim() == "phone-menu"));
+    #[cfg(feature = "demo")]
+    let demo_not_sent_menu = cli
+        .demo_page
+        .as_deref()
+        .is_some_and(|page| page.split(',').any(|part| part.trim() == "failed-menu"));
     let mut update_receipt = launch.receipt;
     // The link, archive, and tray outlive windows. The shell recreates a
     // window when the tray, a notification, or another launch requests one;
@@ -502,6 +507,8 @@ fn run() -> eframe::Result<()> {
                         hover: demo_hover,
                         #[cfg(feature = "demo")]
                         open_phone_menu: demo_phone_menu,
+                        #[cfg(feature = "demo")]
+                        open_not_sent_menu: demo_not_sent_menu,
                         #[cfg(feature = "demo")]
                         tour,
                     }))
@@ -678,6 +685,8 @@ struct Shell {
     hover: Option<egui::Pos2>,
     #[cfg(feature = "demo")]
     open_phone_menu: bool,
+    #[cfg(feature = "demo")]
+    open_not_sent_menu: bool,
 }
 
 /// Pending screenshot request.
@@ -832,6 +841,12 @@ impl Shell {
         #[cfg(feature = "demo")]
         if std::mem::take(&mut self.open_phone_menu) {
             egui::Popup::open_id(ui.ctx(), zapfast::demo::phone_menu_popup_id());
+        }
+        #[cfg(feature = "demo")]
+        if std::mem::take(&mut self.open_not_sent_menu)
+            && let Some(popup) = zapfast::demo::not_sent_menu_popup_id(app)
+        {
+            egui::Popup::open_id(ui.ctx(), popup);
         }
         app.frame_ui(ui);
         #[cfg(target_os = "macos")]

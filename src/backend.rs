@@ -453,6 +453,11 @@ pub enum Command {
         chat: ChatId,
         id: String,
     },
+    /// Sends one of our messages that was not sent again, as it was.
+    Resend {
+        chat: ChatId,
+        id: String,
+    },
     /// Completion of the account's deletion sync, before removing our copy.
     MessageDeletedForMe {
         generation: u64,

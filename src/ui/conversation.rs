@@ -57,7 +57,7 @@ const SELECT_GUTTER: f32 = SELECT_BOX + 14.0;
 /// Footer label on an outgoing message that failed to send.
 const NOT_SENT: &str = "Not sent";
 const NOT_SENT_HINT: &str =
-    "This message could not be sent, and ZapFast will not retry it. Send it again yourself.";
+    "This message was not sent. Click Not sent to send it again or to cancel it.";
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let Some(chat) = app.current_chat().cloned() else {
@@ -6626,16 +6626,7 @@ fn footer_over_picture(
             failed.size(),
         );
         ui.painter().galley(label.min, failed, Color32::WHITE);
-        let status = Rect::from_min_max(label.min, pos2(row.right(), label.max.y));
-        let response = ui.interact(
-            status,
-            ui.id().with(("not-sent", &message.id)),
-            Sense::hover(),
-        );
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Label, true, NOT_SENT_HINT)
-        });
-        response.on_hover_text(NOT_SENT_HINT);
+        not_sent_menu(ui, view, message, label, actions);
     }
     if pinned {
         x -= FOOTER_MARK_SLOT;
@@ -6714,6 +6705,59 @@ fn status_opens_info(
 
 fn not_sent(message: &Message) -> bool {
     message.from_me && message.status == Delivery::Failed
+}
+
+/// The popup a not-sent message's label opens.
+pub(crate) fn not_sent_menu_id(chat: &str, id: &str) -> egui::Id {
+    egui::Id::new(("not-sent-menu", chat, id))
+}
+
+/// The "Not sent" label explains itself on hover and to screen readers, and
+/// opens Retry and Cancel: send the message again as it was, or delete it,
+/// after the confirmation every deletion asks for. It covers the label
+/// alone, so the ticks beside it still open the message's info.
+fn not_sent_menu(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    message: &Message,
+    label: Rect,
+    actions: &mut Vec<Action>,
+) {
+    let response = ui
+        .interact(
+            label,
+            ui.id().with(("not-sent-menu", &message.id)),
+            Sense::click(),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, NOT_SENT_HINT));
+    let response = response.on_hover_text(NOT_SENT_HINT);
+    let palette = &view.palette;
+    egui::Popup::menu(&response)
+        .id(not_sent_menu_id(&message.chat, &message.id))
+        .frame(widgets::menu_frame(palette))
+        .show(|ui| {
+            if widgets::menu_item(
+                ui,
+                palette,
+                Some(Icon::Refresh),
+                &crate::i18n::gettext(view.locale, "Retry"),
+            ) {
+                actions.push(Action::Resend {
+                    chat: message.chat.clone(),
+                    id: message.id.clone(),
+                });
+            }
+            if widgets::menu_item(
+                ui,
+                palette,
+                Some(Icon::X),
+                &crate::i18n::gettext(view.locale, "Cancel"),
+            ) {
+                actions.push(delete_for_me_action(&message.chat, &message.id));
+            }
+        });
 }
 
 /// Paints the time and ticks at the bubble's right edge without widening it.
@@ -6809,18 +6853,7 @@ fn footer(
             failed.size(),
         );
         ui.painter().galley(label.min, failed, palette.text);
-        // Explain on hover and to screen readers; hovering takes no clicks
-        // from the bubble.
-        let status = Rect::from_min_max(label.min, pos2(rect.right(), label.max.y));
-        let response = ui.interact(
-            status,
-            ui.id().with(("not-sent", &message.id)),
-            Sense::hover(),
-        );
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Label, true, NOT_SENT_HINT)
-        });
-        response.on_hover_text(NOT_SENT_HINT);
+        not_sent_menu(ui, view, message, label, actions);
     }
     if starred {
         x -= FOOTER_MARK_SLOT;

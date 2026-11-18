@@ -8467,6 +8467,9 @@ impl App {
                 // `Event::MessageDeleted` removes it and prunes the selection.
                 self.backend.send(Command::DeleteLocal { chat, id });
             }
+            Action::Resend { chat, id } => {
+                self.backend.send(Command::Resend { chat, id });
+            }
             Action::Attach { documents } => {
                 if let Some(chat) = self.open_chat.clone() {
                     self.backend.send(Command::PickFiles { chat, documents });

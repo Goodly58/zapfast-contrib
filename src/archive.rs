@@ -30,6 +30,7 @@ mod receipts;
 mod reconcile;
 #[cfg(test)]
 mod reconcile_tests;
+mod sending;
 mod stars;
 mod stickers;
 pub use polls::PollVote;
@@ -579,6 +580,7 @@ impl Archive {
         connection.execute_batch(favorites::SCHEMA)?;
         connection.execute_batch(stars::SCHEMA)?;
         connection.execute_batch(pins::SCHEMA)?;
+        connection.execute_batch(sending::SCHEMA)?;
         for (table, column, definition) in MIGRATIONS {
             let exists = connection
                 .prepare(&format!("PRAGMA table_info({table})"))?
@@ -2632,9 +2634,12 @@ impl Archive {
     }
 
     /// Advances delivery state, except that `Failed` may replace it. Stores the
-    /// first timestamp for each delivery stage.
+    /// first timestamp for each delivery stage. Being sent or a receipt also
+    /// moves a failed message on: it proves the message went out after all.
     pub fn set_status(&self, chat: &str, id: &str, status: Delivery, at: i64) -> Result<bool> {
         let rank = status_rank(status);
+        let failed = status_rank(Delivery::Failed);
+        let advances = status >= Delivery::Sent;
         let changed = if status == Delivery::Failed {
             self.connection.execute(
                 "UPDATE messages SET status = ?3 WHERE chat = ?1 AND id = ?2",
@@ -2644,14 +2649,15 @@ impl Archive {
             self.connection.execute(
                 &format!(
                     "UPDATE messages SET status = ?3, {column} = COALESCE({column}, ?4)
-                     WHERE chat = ?1 AND id = ?2 AND status < ?3"
+                     WHERE chat = ?1 AND id = ?2 AND (status < ?3 OR (?6 AND status = ?5))"
                 ),
-                params![chat, id, rank, at],
+                params![chat, id, rank, at, failed, advances],
             )?
         } else {
             self.connection.execute(
-                "UPDATE messages SET status = ?3 WHERE chat = ?1 AND id = ?2 AND status < ?3",
-                params![chat, id, rank],
+                "UPDATE messages SET status = ?3
+                 WHERE chat = ?1 AND id = ?2 AND (status < ?3 OR (?5 AND status = ?4))",
+                params![chat, id, rank, failed, advances],
             )?
         };
         Ok(changed > 0)

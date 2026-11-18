@@ -75,7 +75,9 @@ for the privacy list, or `block-confirm` for its confirmation.
 Use `--demo-page chat-menu` to preview the compact chat context menu,
 `--demo-page archive-failed` to simulate a failed archive request while
 keeping the chat open and showing the retry error,
-`--demo-page chat-header-menu` for the menu at the top of an open chat, and
+`--demo-page chat-header-menu` for the menu at the top of an open chat,
+`--demo-page failed-menu` for a message that was not sent with its Retry and
+Cancel menu open, and
 `--demo-page chat,voice,voice-menu` for a voice message's menu with its speeds.
 `--demo-page motion` shows a motion photo, `motion-playing` plays its clip in
 the bubble, `motion-preview` opens the photo in the full-window viewer, and

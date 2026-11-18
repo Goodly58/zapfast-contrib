@@ -918,6 +918,12 @@ pub async fn run(
             }
         }
     };
+    // No send runs yet, so one still noted was cut off when ZapFast last quit.
+    match archive.fail_cut_off_sends() {
+        Ok(0) => {}
+        Ok(count) => log::info!("{count} messages cut off while sending are now not sent"),
+        Err(error) => log::warn!("could not find sends cut off at the last quit: {error}"),
+    }
     let (wa_sender, wa_events) = mpsc::unbounded_channel();
     let privacy_confirmed = archive
         .meta("chat_privacy_ready_v1")
@@ -6071,6 +6077,9 @@ impl Worker {
                 message.id.clone(),
                 AwaitingAck::Message(message.chat.clone()),
             );
+            if let Err(error) = self.archive.note_sending(&message.chat, &message.id) {
+                log::warn!("could not note a running send: {error}");
+            }
         }
         self.retire_local_call_twins(&message);
         if existing
@@ -7623,6 +7632,7 @@ impl Worker {
             Command::DeleteLocal { chat, id } => {
                 self.delete_message_for_me(chat, id);
             }
+            Command::Resend { chat, id } => self.resend(chat, id),
             Command::MessageDeletedForMe {
                 generation,
                 chat,
@@ -9067,6 +9077,7 @@ impl Worker {
                 let _ = self
                     .archive
                     .set_status(&chat, &id, status, crate::util::now());
+                let _ = self.archive.sending_finished(&chat, &id);
                 self.emit_message(&chat, &id);
                 self.emit_chat(&chat);
                 self.advance_serial_forward(&id);
@@ -9762,6 +9773,57 @@ impl Worker {
 
     /// Sends a spot as a location, keeping the row locally the way a phone
     /// does, so the bubble shows before the phone acknowledges it.
+    /// Sends one of our messages that was not sent again, as it was filed:
+    /// the stored message keeps its quote, mentions and preview, and its id,
+    /// so a first attempt that did arrive is not delivered twice.
+    fn resend(&mut self, chat: ChatId, id: String) {
+        let Some(client) = self.connected_client() else {
+            self.emit(Event::Error(
+                "Not connected to WhatsApp: the message was not sent again".to_owned(),
+            ));
+            return;
+        };
+        let Some(jid) = Self::jid_of(&chat) else {
+            return;
+        };
+        let message = self
+            .archive
+            .raw(&chat, &id)
+            .ok()
+            .flatten()
+            .and_then(|raw| wa::Message::decode_from_slice(&raw).ok());
+        let Some(mut message) = message else {
+            self.emit(Event::Error(
+                "This message cannot be sent again: send it as a new message".to_owned(),
+            ));
+            return;
+        };
+        match self.archive.retry_send(&chat, &id) {
+            Ok(true) => {}
+            // Sent or removed meanwhile: there is nothing to retry.
+            Ok(false) => return,
+            Err(error) => {
+                log::warn!("could not ready a message to send again: {error}");
+                return;
+            }
+        }
+        let expiration = self.apply_ephemeral(&chat, &mut message);
+        self.awaiting_ack
+            .insert(id.clone(), AwaitingAck::Message(chat.clone()));
+        self.emit_message(&chat, &id);
+        self.emit_chat(&chat);
+        tokio::spawn(send_outgoing(
+            client,
+            self.commands.clone(),
+            chat,
+            jid,
+            id,
+            message,
+            expiration,
+            None,
+        ));
+    }
+
     fn send_location(
         &mut self,
         chat: ChatId,
@@ -20633,6 +20695,77 @@ mod receipt_tests {
             forwarded: false,
             thumbnail: None,
         }
+    }
+
+    fn own_status(worker: &Worker, id: &str) -> Delivery {
+        worker
+            .archive
+            .message(PEER, id)
+            .expect("read")
+            .expect("stored")
+            .status
+    }
+
+    #[tokio::test]
+    async fn a_send_of_ours_is_noted_until_it_reports() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        for (id, at) in [("cut", 1), ("done", 2)] {
+            let pending = Message {
+                status: Delivery::Pending,
+                ..own_message(id, at)
+            };
+            worker.store_message(pending, None, None);
+        }
+        worker
+            .handle_command(Command::Sent {
+                chat: PEER.into(),
+                id: "done".into(),
+                error: None,
+            })
+            .await;
+
+        // What the next start does, while no send runs.
+        assert_eq!(worker.archive.fail_cut_off_sends().expect("cut off"), 1);
+        assert_eq!(own_status(&worker, "cut"), Delivery::Failed);
+        assert_eq!(own_status(&worker, "done"), Delivery::Sent);
+    }
+
+    #[tokio::test]
+    async fn a_retry_while_offline_keeps_the_message_not_sent() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        let failed = Message {
+            status: Delivery::Failed,
+            ..own_message("m", 1)
+        };
+        let raw = outgoing_text("hi".into(), None, &[]).encode_to_vec();
+        worker.store_message(failed, Some(raw), None);
+        while events.try_recv().is_ok() {}
+
+        worker
+            .handle_command(Command::Resend {
+                chat: PEER.into(),
+                id: "m".into(),
+            })
+            .await;
+
+        assert_eq!(own_status(&worker, "m"), Delivery::Failed);
+        assert!(
+            events.try_iter().any(
+                |event| matches!(event, Event::Error(error) if error.contains("not sent again"))
+            )
+        );
+    }
+
+    #[test]
+    fn a_receipt_shows_a_message_marked_not_sent_arrived() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let failed = Message {
+            status: Delivery::Failed,
+            ..own_message("m", 1)
+        };
+        worker.store_message(failed, None, None);
+        worker.on_receipt(&receipt(PEER, &["m"], ReceiptType::Delivered));
+        assert_eq!(own_status(&worker, "m"), Delivery::Delivered);
     }
 
     fn receipt(chat: &str, ids: &[&str], kind: ReceiptType) -> wa_events::Receipt {

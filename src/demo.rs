@@ -2932,8 +2932,9 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
             }
             "shortcuts" => app.dialog = Some(Dialog::Shortcuts),
             "about" => app.dialog = Some(Dialog::About),
-            "failed" => {
+            "failed" | "failed-menu" => {
                 // The newest outgoing message in the open chat failed to send.
+                // `failed-menu` also opens its Retry and Cancel menu.
                 if let Some(message) = app
                     .open_chat
                     .clone()
@@ -4073,6 +4074,20 @@ fn phone_menu_sample(app: &mut App) {
     row.from_me = false;
     app.open_chat = Some(SAMPLES[0].id.into());
     app.scroll_to_bottom = true;
+}
+
+/// The Retry and Cancel menu of the newest message in the open chat that
+/// was not sent, which `--demo-page failed-menu` opens.
+pub fn not_sent_menu_popup_id(app: &App) -> Option<egui::Id> {
+    let chat = app.open_chat.as_deref()?;
+    let message = app
+        .conversations
+        .get(chat)?
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.from_me && message.status == crate::model::Delivery::Failed)?;
+    Some(crate::ui::conversation::not_sent_menu_id(chat, &message.id))
 }
 
 pub fn phone_menu_popup_id() -> egui::Id {
@@ -9726,6 +9741,7 @@ mod tests {
             "shortcuts",
             "about",
             "failed",
+            "failed-menu",
             "info",
             "info-media",
             "info-docs",
@@ -13543,7 +13559,7 @@ mod tests {
             assert!(
                 nodes
                     .iter()
-                    .any(|(label, _, _)| label.contains("will not retry it"))
+                    .any(|(label, _, _)| label.contains("send it again or to cancel it"))
             );
         }
     }
@@ -20652,7 +20668,7 @@ mod tests {
             .filter(|(_, node)| {
                 node.label()
                     .or_else(|| node.value())
-                    .is_some_and(|label| label.starts_with("This message could not be sent"))
+                    .is_some_and(|label| label.starts_with("This message was not sent"))
             })
             .count();
         assert_eq!(hints, 1, "exactly the failed message carries the hint");
