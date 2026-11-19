@@ -130,10 +130,11 @@ impl Archive {
         )?;
         let aggregate = status_from_rank(rank.unwrap_or(0));
         let now = crate::util::now();
-        // One member's receipt proves a message marked not sent went out,
-        // though its ticks wait for the least advanced member.
+        // One member's receipt proves a message still sending, or marked not
+        // sent, went out, though its ticks wait for the least advanced member.
         let lifted = transaction.execute(
-            "UPDATE messages SET status = ?3 WHERE chat = ?1 AND id = ?2 AND status = ?4
+            "UPDATE messages SET status = ?3
+             WHERE chat = ?1 AND id = ?2 AND status IN (?4, ?6)
              AND EXISTS (SELECT 1 FROM group_receipts
                  WHERE chat = ?1 AND id = ?2 AND status >= ?5)",
             params![
@@ -141,7 +142,8 @@ impl Archive {
                 id,
                 status_rank(Delivery::Sent),
                 status_rank(Delivery::Failed),
-                status_rank(Delivery::Delivered)
+                status_rank(Delivery::Delivered),
+                status_rank(Delivery::Pending)
             ],
         )?;
         let mut changed = lifted > 0;
@@ -510,24 +512,27 @@ mod tests {
     }
 
     #[test]
-    fn one_members_receipt_shows_a_group_message_marked_not_sent_went_out() {
-        let archive = Archive::in_memory().unwrap();
+    fn one_members_receipt_shows_a_group_message_went_out() {
         let chat = "120363000000000001@g.us";
         let (a, b) = ("a@s.whatsapp.net", "b@s.whatsapp.net");
-        let mut row = super::super::tests::message(chat, "m", 100, true);
-        row.status = Delivery::Failed;
-        archive.insert_message(&row, None).unwrap();
-        archive
-            .snapshot_group_recipients(chat, "m", &[a.into(), b.into()])
-            .unwrap();
-        let status = || archive.message(chat, "m").unwrap().unwrap().status;
         let delivered = Delivery::Delivered;
+        // Still sending, or marked not sent.
+        for start in [Delivery::Pending, Delivery::Failed] {
+            let archive = Archive::in_memory().unwrap();
+            let mut row = super::super::tests::message(chat, "m", 100, true);
+            row.status = start;
+            archive.insert_message(&row, None).unwrap();
+            archive
+                .snapshot_group_recipients(chat, "m", &[a.into(), b.into()])
+                .unwrap();
+            let status = || archive.message(chat, "m").unwrap().unwrap().status;
 
-        let changed = archive.group_receipt(chat, "m", a, delivered, 1);
-        assert!(changed.unwrap(), "the transcript is told");
-        assert_eq!(status(), Delivery::Sent, "the ticks wait for b");
-        archive.group_receipt(chat, "m", b, delivered, 2).unwrap();
-        assert_eq!(status(), Delivery::Delivered);
+            let changed = archive.group_receipt(chat, "m", a, delivered, 1);
+            assert!(changed.unwrap(), "the transcript is told");
+            assert_eq!(status(), Delivery::Sent, "the ticks wait for b");
+            archive.group_receipt(chat, "m", b, delivered, 2).unwrap();
+            assert_eq!(status(), Delivery::Delivered);
+        }
     }
 
     #[test]

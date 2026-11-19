@@ -24230,6 +24230,37 @@ mod receipt_tests {
         assert_eq!(own_status(&worker, "mine"), Delivery::Sent);
     }
 
+    #[tokio::test]
+    async fn a_group_receipt_before_a_send_error_leaves_the_message_sent() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let group = "120363000000000001@g.us";
+        let (a, b) = ("a@s.whatsapp.net", "b@s.whatsapp.net");
+        let pending = Message {
+            chat: group.into(),
+            status: Delivery::Pending,
+            ..own_message("mine", 200)
+        };
+        worker.store_message(pending, None, None);
+        let archive = &worker.archive;
+        archive
+            .snapshot_group_recipients(group, "mine", &[a.into(), b.into()])
+            .expect("snapshot");
+        archive
+            .group_receipt(group, "mine", a, Delivery::Delivered, 150)
+            .expect("receipt");
+        worker
+            .handle_command(Command::Sent {
+                chat: group.into(),
+                id: "mine".into(),
+                error: Some("timed out".into()),
+            })
+            .await;
+
+        // a has it, though b's tick is still awaited.
+        let stored = worker.archive.message(group, "mine").expect("read");
+        assert_eq!(stored.expect("stored").status, Delivery::Sent);
+    }
+
     #[test]
     fn replying_on_the_phone_reads_only_preceding_messages() {
         let (mut worker, events, _inbox, _wa) = worker();
