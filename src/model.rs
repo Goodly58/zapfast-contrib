@@ -3036,6 +3036,11 @@ pub enum Action {
         chat: ChatId,
         id: String,
     },
+    /// Sends one of our messages that was not sent again.
+    Resend {
+        chat: ChatId,
+        id: String,
+    },
     /// Stars or unstars one message from its bubble's menu.
     SetStar {
         chat: ChatId,

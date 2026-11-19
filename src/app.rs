@@ -7413,7 +7413,8 @@ impl App {
             | Action::ReplyInteractive { chat, .. }
             | Action::CreatePoll { chat, .. }
             | Action::VotePoll { chat, .. }
-            | Action::React { chat, .. } => Some(chat.as_str()),
+            | Action::React { chat, .. }
+            | Action::Resend { chat, .. } => Some(chat.as_str()),
             Action::SendPending { account, chat, .. } if account == &self.account().id => {
                 Some(chat.as_str())
             }
@@ -8466,6 +8467,9 @@ impl App {
                 // The message stays until WhatsApp accepts the deletion.
                 // `Event::MessageDeleted` removes it and prunes the selection.
                 self.backend.send(Command::DeleteLocal { chat, id });
+            }
+            Action::Resend { chat, id } => {
+                self.backend.send(Command::Resend { chat, id });
             }
             Action::Attach { documents } => {
                 if let Some(chat) = self.open_chat.clone() {
