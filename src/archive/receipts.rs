@@ -130,13 +130,14 @@ impl Archive {
         )?;
         let aggregate = status_from_rank(rank.unwrap_or(0));
         let now = crate::util::now();
-        // One member's receipt proves a message still sending, or marked not
-        // sent, went out, though its ticks wait for the least advanced member.
+        // A receipt from one member of the saved audience proves a message
+        // still sending, or marked not sent, went out, though its ticks wait
+        // for the least advanced member. A send saves its audience first.
         let lifted = transaction.execute(
             "UPDATE messages SET status = ?3
              WHERE chat = ?1 AND id = ?2 AND status IN (?4, ?6)
              AND EXISTS (SELECT 1 FROM group_receipts
-                 WHERE chat = ?1 AND id = ?2 AND status >= ?5)",
+                 WHERE chat = ?1 AND id = ?2 AND expected = 1 AND status >= ?5)",
             params![
                 chat,
                 id,
