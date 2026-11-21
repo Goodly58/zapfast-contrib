@@ -160,6 +160,14 @@ pub struct SendTurn {
     pub gate: crate::model::UploadGate,
 }
 
+/// Held by an attachment the worker accepted until it is archived: while it
+/// is prepared or uploaded, or waits for the one before it. A closed window
+/// waits while any is held, since nothing would show it was cut off.
+#[derive(Debug)]
+pub struct SendHold {
+    _shared: std::sync::Arc<()>,
+}
+
 #[derive(Debug)]
 pub enum Command {
     FetchBlocklist,
@@ -450,6 +458,11 @@ pub enum Command {
         id: String,
     },
     DeleteLocal {
+        chat: ChatId,
+        id: String,
+    },
+    /// Sends one of our messages that was not sent again, as it was.
+    Resend {
         chat: ChatId,
         id: String,
     },
@@ -1012,6 +1025,9 @@ pub enum Command {
     /// Whether the person is looking at ZapFast. While they are not, the
     /// linked phone keeps receiving push notifications.
     SetOnline(bool),
+    /// Answers once none of the account's messages is still sending, so a
+    /// closed window can let a send finish before ZapFast quits.
+    SendsFinished(tokio::sync::oneshot::Sender<()>),
     Shutdown,
     /// Internal send result.
     Sent {
@@ -1096,6 +1112,8 @@ pub enum Command {
         /// Its place in the chat's line, for an attachment that waits for the
         /// one staged before it.
         turn: Option<SendTurn>,
+        /// Held until the worker has archived it.
+        hold: SendHold,
     },
     /// Phone numbers a group's metadata named, as (privacy id, number).
     LearnNumbers(Vec<(String, String)>),

@@ -949,6 +949,8 @@ pub struct App {
     pub window_hidden: bool,
     /// Whether window close should keep the process running.
     pub hide_intent: bool,
+    /// A closed window waiting for the accounts' sends before quitting.
+    closing: Option<Closing>,
     /// Whether a headless app should create a window.
     pub wants_show: bool,
     /// A hidden start whose tray item no panel shows yet waits until then
@@ -1245,6 +1247,8 @@ impl fastframe_shell::Resident for App {
             fastframe_shell::Headless::Quit
         } else if self.wants_show {
             fastframe_shell::Headless::Show
+        } else if self.closing_done(Instant::now()) {
+            fastframe_shell::Headless::Quit
         } else {
             fastframe_shell::Headless::Wait
         }
@@ -1286,6 +1290,52 @@ const TRAY_WAIT: Duration = Duration::from_secs(30);
 /// How long quitting waits for the accounts' runtimes to finish their
 /// work and disconnect.
 const QUIT_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a closed window waits for a message still sending before
+/// ZapFast quits anyway, leaving it to show as not sent.
+const SEND_WAIT: Duration = Duration::from_secs(60);
+
+/// A window closed while a message may still be sending. ZapFast runs
+/// without it until each account's worker says no send is running.
+struct Closing {
+    until: Instant,
+    waiting: Vec<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl Closing {
+    /// Asks every account's worker to say when its sends have finished.
+    /// A worker runs its commands in order, so a send asked for just before
+    /// is counted.
+    fn ask(accounts: &[Account], now: Instant) -> Self {
+        let waiting = accounts
+            .iter()
+            .map(|account| {
+                let (done, finished) = tokio::sync::oneshot::channel();
+                account.backend.send(Command::SendsFinished(done));
+                finished
+            })
+            .collect();
+        Self {
+            until: now + SEND_WAIT,
+            waiting,
+        }
+    }
+
+    /// Whether every worker has answered or stopped without answering, or
+    /// the wait is over.
+    fn done(&mut self, now: Instant) -> bool {
+        self.waiting.retain_mut(unanswered);
+        self.waiting.is_empty() || now >= self.until
+    }
+}
+
+/// Whether a worker asked about its sends has yet to answer.
+fn unanswered(finished: &mut tokio::sync::oneshot::Receiver<()>) -> bool {
+    matches!(
+        finished.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    )
+}
 
 const TRAY_SHOW: &str = "show";
 const TRAY_LOCK: &str = "lock";
@@ -1798,6 +1848,7 @@ impl App {
             tray_lockable,
             window_hidden: false,
             hide_intent: false,
+            closing: None,
             wants_show: false,
             tray_wait: None,
             tray_clicked: None,
@@ -2537,6 +2588,10 @@ impl App {
         if !self.account().settings.notifications || self.power.conditions().display_off {
             return;
         }
+        // The window was closed, and ZapFast quits once its sends finish.
+        if self.closing.is_some() {
+            return;
+        }
         let Some(chat) = self.chat(chat_id) else {
             return;
         };
@@ -2693,6 +2748,9 @@ impl App {
 
     /// Initializes a newly created window.
     pub fn attach(&mut self, ctx: &egui::Context) {
+        // A window is open again, shown or replacing the last one: closing it
+        // waits for the sends afresh.
+        self.closing = None;
         // Texture handles belong to the window's egui context. Keep the
         // underlying pictures and recreate handles for the new window.
         self.call_local_texture = None;
@@ -7160,12 +7218,25 @@ impl App {
         // Close the window and continue headless when background mode is
         // enabled. Decided here rather than in `frame_ui`, which eframe skips
         // for a minimized window: closing one from the taskbar quit instead.
-        if ctx.input(|input| input.viewport().close_requested())
-            && !self.quit_requested
-            && self.keeps_running_on_close()
-        {
-            self.hide_intent = true;
+        if ctx.input(|input| input.viewport().close_requested()) && !self.quit_requested {
+            if self.keeps_running_on_close() {
+                self.hide_intent = true;
+            } else if !self.reopen && self.closing.is_none() {
+                // Quitting now would cut off a message still sending, which
+                // then shows as not sent at the next start: run without a
+                // window until the accounts' sends have finished.
+                self.closing = Some(Closing::ask(&self.accounts, Instant::now()));
+                self.hide_intent = true;
+            }
         }
+    }
+
+    /// Whether a window closed while sends ran may now quit.
+    fn closing_done(&mut self, now: Instant) -> bool {
+        let Some(closing) = &mut self.closing else {
+            return false;
+        };
+        closing.done(now)
     }
 
     pub fn load_custom_themes(&mut self) {
@@ -7413,7 +7484,8 @@ impl App {
             | Action::ReplyInteractive { chat, .. }
             | Action::CreatePoll { chat, .. }
             | Action::VotePoll { chat, .. }
-            | Action::React { chat, .. } => Some(chat.as_str()),
+            | Action::React { chat, .. }
+            | Action::Resend { chat, .. } => Some(chat.as_str()),
             Action::SendPending { account, chat, .. } if account == &self.account().id => {
                 Some(chat.as_str())
             }
@@ -8466,6 +8538,9 @@ impl App {
                 // The message stays until WhatsApp accepts the deletion.
                 // `Event::MessageDeleted` removes it and prunes the selection.
                 self.backend.send(Command::DeleteLocal { chat, id });
+            }
+            Action::Resend { chat, id } => {
+                self.backend.send(Command::Resend { chat, id });
             }
             Action::Attach { documents } => {
                 if let Some(chat) = self.open_chat.clone() {
@@ -18121,7 +18196,7 @@ mod tests {
 
     /// eframe runs only the logic pass for a minimized window, so closing one
     /// (from the taskbar, say) must still hide it to the tray rather than
-    /// quit, and quit when nothing could bring it back.
+    /// quit, and, when nothing could bring it back, wait only for its sends.
     #[test]
     fn closing_a_minimized_window_hides_it_to_the_tray() {
         use fastframe_shell::{Closed, Resident};
@@ -18144,13 +18219,74 @@ mod tests {
         let mut app = self::app();
         app.test_tray_shown = Some(false);
         close_minimized(&mut app);
-        assert_eq!(app.closed(), Closed::Quit, "no tray, no way back");
+        assert_eq!(app.closed(), Closed::Hide, "only until the sends finish");
+        assert!(app.closing.is_some());
 
         let mut app = self::app();
         app.test_tray_shown = Some(true);
         app.quit_requested = true;
         close_minimized(&mut app);
         assert_eq!(app.closed(), Closed::Quit);
+    }
+
+    /// With nothing to keep ZapFast running, closing the window lets a
+    /// message still sending finish: it runs without a window until every
+    /// account's worker says no send is running, or stops without saying,
+    /// or `SEND_WAIT` is over. Launching it meanwhile brings the window back.
+    #[test]
+    fn closing_the_window_lets_a_send_finish_before_quitting() {
+        use fastframe_shell::{Closed, Headless, Resident};
+        let ctx = egui::Context::default();
+        let close = |app: &mut App| {
+            let (backend, mut inbox) = Backend::recording();
+            app.backend = backend;
+            app.test_tray_shown = Some(false);
+            let mut input = egui::RawInput::default();
+            let info = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+            info.events.push(egui::ViewportEvent::Close);
+            let mut output = ctx.run_ui(input, |ui| app.window_logic(ui.ctx()));
+            output.textures_delta.clear();
+            assert_eq!(app.closed(), Closed::Hide, "hidden while sends finish");
+            Resident::window_gone(app);
+            std::iter::from_fn(|| inbox.try_recv().ok())
+                .find_map(|command| match command {
+                    Command::SendsFinished(done) => Some(done),
+                    _ => None,
+                })
+                .expect("the worker is asked")
+        };
+
+        let mut app = app();
+        let done = close(&mut app);
+        assert_eq!(app.headless_frame(&ctx), Headless::Wait, "a send runs");
+        done.send(()).expect("still waiting");
+        assert_eq!(app.headless_frame(&ctx), Headless::Quit);
+
+        let mut app = self::app();
+        drop(close(&mut app));
+        assert_eq!(
+            app.headless_frame(&ctx),
+            Headless::Quit,
+            "a worker that stopped is sending nothing"
+        );
+
+        // The shell attaches every window it opens, whether shown again or
+        // replacing the one closed in the same frame.
+        let mut app = self::app();
+        let _done = close(&mut app);
+        app.wants_show = true;
+        assert_eq!(app.headless_frame(&ctx), Headless::Show);
+        app.attach(&ctx);
+        assert!(app.closing.is_none(), "launched again: not quitting");
+
+        let (_done, finished) = tokio::sync::oneshot::channel();
+        let now = Instant::now();
+        let mut closing = Closing {
+            until: now + SEND_WAIT,
+            waiting: vec![finished],
+        };
+        assert!(!closing.done(now));
+        assert!(closing.done(now + SEND_WAIT), "the wait is over");
     }
 
     /// A Wayland compositor ignores an app's focus and unminimize requests, so

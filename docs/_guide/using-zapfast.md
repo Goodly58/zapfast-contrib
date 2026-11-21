@@ -136,6 +136,16 @@ server acknowledged it, so a reply no longer sorts above it when this
 computer's clock runs ahead. Until the server answers, and for a poll, the
 message keeps this computer's time.
 
+**Development builds** show a message as **Not sent** when ZapFast quit
+before it went out, instead of leaving it waiting with a clock. Where closing
+the window quits ZapFast, with **Keep running when the window closes** off or
+no tray icon to reopen it from, a message or attachment still sending finishes
+first: the window goes, and ZapFast quits once it has gone out, waiting up to a
+minute. Launching ZapFast meanwhile brings the window back. **Quit** still
+quits at once. Click **Not sent** on a message that was not sent to choose
+**Retry**, which sends it again as it was, reply and mentions included, or
+**Cancel**, which deletes it.
+
 **Development builds** preserve edited replies and the phone's order for
 messages sent within the same second when loading history. If an earlier
 build missed a message or put nearby messages in the wrong order, right-click

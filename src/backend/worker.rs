@@ -918,6 +918,12 @@ pub async fn run(
             }
         }
     };
+    // No send runs yet, so one still noted was cut off when ZapFast last quit.
+    match archive.fail_cut_off_sends() {
+        Ok(0) => {}
+        Ok(count) => log::info!("{count} messages cut off while sending are now not sent"),
+        Err(error) => log::warn!("could not find sends cut off at the last quit: {error}"),
+    }
     let (wa_sender, wa_events) = mpsc::unbounded_channel();
     let privacy_confirmed = archive
         .meta("chat_privacy_ready_v1")
@@ -1094,6 +1100,8 @@ pub async fn run(
         interactive_sending: HashMap::new(),
         awaiting_ack: HashMap::new(),
         send_turns: HashMap::new(),
+        send_waiters: Vec::new(),
+        send_holds: Arc::new(()),
         receipts_watch: None,
         receipts_pruned: Instant::now(),
         early: Default::default(),
@@ -1222,6 +1230,8 @@ pub async fn run(
                 worker.reconcile_call().await;
             }
         }
+        // A send finishes on a command or an event: tell a closed window.
+        worker.settle_send_waiters();
     }
     worker.stop_chat_export().await;
     worker.shutdown_call().await;
@@ -1535,6 +1545,11 @@ struct Worker {
     awaiting_ack: HashMap<String, AwaitingAck>,
     /// Per chat, resolved when the attachment queued last has gone out.
     send_turns: HashMap<ChatId, oneshot::Receiver<()>>,
+    /// Closed windows waiting for this account's sends to finish.
+    send_waiters: Vec<oneshot::Sender<()>>,
+    /// Shared with each `SendHold`, so more than one holder means an
+    /// attachment is still on its way.
+    send_holds: Arc<()>,
     /// The group message whose "Message info" is open.
     receipts_watch: Option<(ChatId, String)>,
     /// When receipts that never found their message were last dropped.
@@ -2436,8 +2451,18 @@ impl Worker {
         match self.archive.restamp_sent(&chat, &ack.id, at.timestamp()) {
             Ok(changed) => {
                 self.awaiting_ack.remove(&ack.id);
-                if changed {
+                // The server has the message: a quit before its send reports
+                // must not mark it not sent at the next start.
+                let filed = self
+                    .archive
+                    .set_status(&chat, &ack.id, Delivery::Sent, at.timestamp());
+                if filed.is_ok() {
+                    let _ = self.archive.sending_finished(&chat, &ack.id);
+                }
+                if changed || filed.unwrap_or(false) {
                     self.emit_message(&chat, &ack.id);
+                }
+                if changed {
                     self.emit_chat(&chat);
                 }
             }
@@ -6061,12 +6086,20 @@ impl Worker {
             message.content.keep_local_paths(&existing.content);
             keep_live_location_notice(&mut message.content, existing);
         }
-        if let Err(error) = self.archive.insert_message(&message, raw.as_deref()) {
+        // A message of ours about to be sent is stored with a note of its
+        // send, so one cut off can be offered again.
+        let sending = message.from_me && message.status == Delivery::Pending;
+        let stored = if sending {
+            self.archive.insert_sending(&message, raw.as_deref())
+        } else {
+            self.archive.insert_message(&message, raw.as_deref())
+        };
+        if let Err(error) = stored {
             log::warn!("could not store a message: {error}");
             return;
         }
         // Only a stored message can be moved to the server's time.
-        if message.from_me && message.status == Delivery::Pending {
+        if sending {
             self.awaiting_ack.insert(
                 message.id.clone(),
                 AwaitingAck::Message(message.chat.clone()),
@@ -6664,10 +6697,13 @@ impl Worker {
                 let existing = self.archive.message(&id, &row.id).ok().flatten();
                 // A transcript already on screen is not paged again, so a
                 // status history moves forward, such as a voice message the
-                // phone played, is sent to it.
-                let status_advanced = existing
-                    .as_ref()
-                    .is_some_and(|existing| existing.status < row.status);
+                // phone played, is sent to it. A copy that was sent moves a
+                // message marked not sent on too, as the archive files it.
+                let status_advanced = existing.as_ref().is_some_and(|existing| {
+                    existing.status < row.status
+                        || (existing.status == Delivery::Failed
+                            && (Delivery::Sent..Delivery::Failed).contains(&row.status))
+                });
                 // What the info panel listed for this row before it lands,
                 // so a change to its pictures, documents or links is told.
                 let before = existing.as_ref().map(|existing| existing.content.clone());
@@ -7284,7 +7320,8 @@ impl Worker {
             | Command::SendSticker { chat, .. }
             | Command::SendGif { chat, .. }
             | Command::SendLocation { chat, .. }
-            | Command::CreatePoll { chat, .. } => Some(chat),
+            | Command::CreatePoll { chat, .. }
+            | Command::Resend { chat, .. } => Some(chat),
             // A batch goes to every recipient or to none of them.
             Command::Forward { to_chats, .. } => to_chats
                 .iter()
@@ -7623,6 +7660,7 @@ impl Worker {
             Command::DeleteLocal { chat, id } => {
                 self.delete_message_for_me(chat, id);
             }
+            Command::Resend { chat, id } => self.resend(chat, id),
             Command::MessageDeletedForMe {
                 generation,
                 chat,
@@ -7723,7 +7761,13 @@ impl Worker {
                 row,
                 raw,
                 turn,
-            } => self.outbound(chat, *row, raw, turn),
+                hold,
+            } => {
+                self.outbound(chat, *row, raw, turn);
+                // Archived with the note of its send by now, which a closed
+                // window waits on from here.
+                drop(hold);
+            }
             Command::SendSticker {
                 chat,
                 path,
@@ -9014,6 +9058,10 @@ impl Worker {
                 self.start_bot().await;
             }
             Command::Shutdown => {}
+            Command::SendsFinished(done) => {
+                self.send_waiters.push(done);
+                self.settle_send_waiters();
+            }
             Command::OlderSent {
                 chat,
                 serial,
@@ -9056,6 +9104,19 @@ impl Worker {
                     }
                     return;
                 }
+                // A phone number learned during the send moved the message,
+                // and the note of its send, out of the privacy id's chat.
+                let chat = self.canonical_str(&chat);
+                let error = match error {
+                    // The server acknowledged the message, so it went out: it
+                    // is not marked not sent, as a retry would only move it
+                    // down the chat.
+                    Some(error) if self.went_out(&chat, &id) => {
+                        log::warn!("an acknowledged message reported an error: {error}");
+                        None
+                    }
+                    error => error,
+                };
                 let status = match &error {
                     Some(_) => Delivery::Failed,
                     None => Delivery::Sent,
@@ -9064,9 +9125,15 @@ impl Worker {
                     // A failed send is never acked; a retry stores the row again.
                     self.awaiting_ack.remove(&id);
                 }
-                let _ = self
+                // The note goes only once the outcome is filed: a message
+                // left pending without it would never be offered again.
+                if self
                     .archive
-                    .set_status(&chat, &id, status, crate::util::now());
+                    .set_status(&chat, &id, status, crate::util::now())
+                    .is_ok()
+                {
+                    let _ = self.archive.sending_finished(&chat, &id);
+                }
                 self.emit_message(&chat, &id);
                 self.emit_chat(&chat);
                 self.advance_serial_forward(&id);
@@ -9758,6 +9825,97 @@ impl Worker {
             let _ = events.send(Event::LinkPreview { url, preview });
             waker.wake();
         }));
+    }
+
+    /// Sends one of our messages that was not sent again, as it was filed:
+    /// the stored message keeps its quote, mentions and preview, and its id,
+    /// so a first attempt that did arrive is not delivered twice.
+    fn resend(&mut self, chat: ChatId, id: String) {
+        let Some(client) = self.connected_client() else {
+            self.emit(Event::Error(
+                "Not connected to WhatsApp: the message was not sent again".to_owned(),
+            ));
+            return;
+        };
+        let Some(jid) = Self::jid_of(&chat) else {
+            return;
+        };
+        let Some((message, expiration)) = self.stored_send(&chat, &id) else {
+            self.emit(Event::Error(
+                "This message cannot be sent again: send it as a new message".to_owned(),
+            ));
+            return;
+        };
+        match self.archive.retry_send(&chat, &id) {
+            Ok(true) => {}
+            // Sent or removed meanwhile: there is nothing to retry.
+            Ok(false) => return,
+            Err(error) => {
+                log::warn!("could not ready a message to send again: {error}");
+                return;
+            }
+        }
+        self.awaiting_ack
+            .insert(id.clone(), AwaitingAck::Message(chat.clone()));
+        self.emit_message(&chat, &id);
+        self.emit_chat(&chat);
+        tokio::spawn(send_outgoing(
+            client,
+            self.commands.clone(),
+            chat,
+            jid,
+            id,
+            message,
+            expiration,
+            None,
+        ));
+    }
+
+    /// Answers the closed windows waiting for this account's sends once
+    /// none is running: no attachment is on its way, and no message noted as
+    /// sending is still pending. A note that cannot be read holds nothing
+    /// up: quitting must not wait on the archive.
+    fn settle_send_waiters(&mut self) {
+        self.send_waiters.retain(|done| !done.is_closed());
+        if self.send_waiters.is_empty()
+            || Arc::strong_count(&self.send_holds) > 1
+            || self.archive.sends_running().unwrap_or(false)
+        {
+            return;
+        }
+        for done in self.send_waiters.drain(..) {
+            let _ = done.send(());
+        }
+    }
+
+    /// Holds the place of an attachment accepted for sending until it is
+    /// archived.
+    fn hold(&self) -> super::SendHold {
+        super::SendHold {
+            _shared: Arc::clone(&self.send_holds),
+        }
+    }
+
+    /// Whether the server acknowledged a message of ours, or a receipt or a
+    /// copy that was sent showed it went out.
+    fn went_out(&self, chat: &str, id: &str) -> bool {
+        let went_out = Delivery::Sent..Delivery::Failed;
+        let stored = self.archive.message(chat, id).ok().flatten();
+        stored.is_some_and(|stored| went_out.contains(&stored.status))
+    }
+
+    /// A message of ours as it was filed, to send again, and the timer it
+    /// was first sent with, even if the chat's has changed since: a retry
+    /// sends the message as it was.
+    fn stored_send(&self, chat: &str, id: &str) -> Option<(wa::Message, Option<u32>)> {
+        let message = self
+            .archive
+            .raw(chat, id)
+            .ok()
+            .flatten()
+            .and_then(|raw| wa::Message::decode_from_slice(&raw).ok())?;
+        let expiration = archived_expiration(&message);
+        Some((message, expiration))
     }
 
     /// Sends a spot as a location, keeping the row locally the way a phone
@@ -11574,6 +11732,7 @@ impl Worker {
             // Like the caption, the reply belongs to the first file.
             let quote = quote.take();
             let commands = self.commands.clone();
+            let hold = self.hold();
             let chat = chat.clone();
             let dir = self.dirs.media_cache_dir();
             let me = self.me();
@@ -11653,6 +11812,7 @@ impl Worker {
                             row: Box::new(row),
                             raw,
                             turn: Some(turn),
+                            hold,
                         });
                     }
                     // Cancelled on purpose: nothing to tell.
@@ -11709,6 +11869,7 @@ impl Worker {
         }
         let (previous, turn) = self.send_turn(&chat);
         let commands = self.commands.clone();
+        let hold = self.hold();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         // A pasted picture has no name; the strip calls it a picture.
@@ -11762,6 +11923,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: Some(turn),
+                        hold,
                     });
                 }
                 Err(_) if uploading.cancelled() => {}
@@ -11796,6 +11958,7 @@ impl Worker {
             return;
         };
         let commands = self.commands.clone();
+        let hold = self.hold();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         tokio::spawn(async move {
@@ -11823,6 +11986,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: None,
+                        hold,
                     });
                 }
                 Err(error) => {
@@ -11888,6 +12052,7 @@ impl Worker {
             return;
         };
         let commands = self.commands.clone();
+        let hold = self.hold();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         tokio::spawn(async move {
@@ -11906,6 +12071,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: None,
+                        hold,
                     });
                 }
                 Err(error) => {
@@ -11933,6 +12099,7 @@ impl Worker {
             return;
         };
         let commands = self.commands.clone();
+        let hold = self.hold();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         tokio::spawn(async move {
@@ -11967,6 +12134,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: None,
+                        hold,
                     });
                 }
                 Err(error) => {
@@ -12275,6 +12443,13 @@ fn apply_ephemeral_expiration(message: &mut wa::Message, expiration: Option<u32>
     message
         .set_ephemeral_expiration(expiration)
         .then_some(expiration)
+}
+
+/// The disappearing timer a stored message of ours was sent with.
+fn archived_expiration(message: &wa::Message) -> Option<u32> {
+    message
+        .get_ephemeral_expiration()
+        .filter(|expiration| *expiration > 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20476,6 +20651,8 @@ mod receipt_tests {
             interactive_sending: HashMap::new(),
             awaiting_ack: HashMap::new(),
             send_turns: HashMap::new(),
+            send_waiters: Vec::new(),
+            send_holds: Arc::new(()),
             receipts_watch: None,
             receipts_pruned: Instant::now(),
             early: Default::default(),
@@ -20633,6 +20810,183 @@ mod receipt_tests {
             forwarded: false,
             thumbnail: None,
         }
+    }
+
+    fn own_status(worker: &Worker, id: &str) -> Delivery {
+        worker
+            .archive
+            .message(PEER, id)
+            .expect("read")
+            .expect("stored")
+            .status
+    }
+
+    #[tokio::test]
+    async fn a_send_of_ours_is_noted_until_it_reports() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        for (id, at) in [("cut", 1), ("done", 2)] {
+            let pending = Message {
+                status: Delivery::Pending,
+                ..own_message(id, at)
+            };
+            worker.store_message(pending, None, None);
+        }
+        worker
+            .handle_command(Command::Sent {
+                chat: PEER.into(),
+                id: "done".into(),
+                error: None,
+            })
+            .await;
+
+        // What the next start does, while no send runs.
+        assert_eq!(worker.archive.fail_cut_off_sends().expect("cut off"), 1);
+        assert_eq!(own_status(&worker, "cut"), Delivery::Failed);
+        assert_eq!(own_status(&worker, "done"), Delivery::Sent);
+    }
+
+    #[tokio::test]
+    async fn a_send_reports_after_its_chat_moved_to_the_phone_number() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let pending = Message {
+            chat: PEER_LID.into(),
+            status: Delivery::Pending,
+            ..own_message("m", 1)
+        };
+        worker.store_message(pending, None, None);
+        worker.learn_lid("167650256810092", "4917663430455");
+        worker
+            .handle_command(Command::Sent {
+                chat: PEER_LID.into(),
+                id: "m".into(),
+                error: None,
+            })
+            .await;
+
+        assert_eq!(own_status(&worker, "m"), Delivery::Sent);
+        assert_eq!(worker.archive.fail_cut_off_sends().expect("cut off"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_send_whose_outcome_was_not_filed_stays_noted() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let pending = Message {
+            status: Delivery::Pending,
+            ..own_message("m", 1)
+        };
+        worker.store_message(pending, None, None);
+        crate::archive::tests::reject_status(&worker.archive, "m");
+        worker
+            .handle_command(Command::Sent {
+                chat: PEER.into(),
+                id: "m".into(),
+                error: None,
+            })
+            .await;
+        crate::archive::tests::accept_status(&worker.archive);
+
+        assert_eq!(
+            worker.archive.fail_cut_off_sends().expect("cut off"),
+            1,
+            "a message still pending is offered again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_to_a_blocked_contact_is_refused() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        worker.privacy_ready = true;
+        worker.blocklist.ids = Some([PEER.into()].into());
+        let failed = Message {
+            status: Delivery::Failed,
+            ..own_message("m", 1)
+        };
+        let raw = outgoing_text("hi".into(), None, &[]).encode_to_vec();
+        worker.store_message(failed, Some(raw), None);
+        while events.try_recv().is_ok() {}
+
+        worker
+            .handle_command(Command::Resend {
+                chat: PEER.into(),
+                id: "m".into(),
+            })
+            .await;
+
+        assert_eq!(own_status(&worker, "m"), Delivery::Failed);
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Error(error) if error.contains("Unblock")))
+        );
+    }
+
+    #[test]
+    fn a_retry_keeps_the_timer_the_message_was_sent_with() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let mut timed = outgoing_text("hi".into(), None, &[]);
+        assert_eq!(
+            apply_ephemeral_expiration(&mut timed, Some(86_400)),
+            Some(86_400)
+        );
+        let plain = outgoing_text("hi".into(), None, &[]);
+        for (id, raw) in [("timed", timed), ("plain", plain)] {
+            let failed = Message {
+                status: Delivery::Failed,
+                ..own_message(id, 1)
+            };
+            let raw = raw.encode_to_vec();
+            worker.store_message(failed, Some(raw), None);
+        }
+        // The chat's timer changes after both were sent.
+        worker.archive.ensure_chat(PEER, "Fixture").expect("chat");
+        worker
+            .archive
+            .set_ephemeral(PEER, 604_800, 2)
+            .expect("timer");
+        assert_eq!(worker.ephemeral_expiration(PEER), Some(604_800));
+
+        let timer = |id: &str| worker.stored_send(PEER, id).map(|sent| sent.1);
+        assert_eq!(timer("timed"), Some(Some(86_400)));
+        assert_eq!(timer("plain"), Some(None), "no timer is added either");
+    }
+
+    #[tokio::test]
+    async fn a_retry_while_offline_keeps_the_message_not_sent() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        worker.privacy_ready = true;
+        let failed = Message {
+            status: Delivery::Failed,
+            ..own_message("m", 1)
+        };
+        let raw = outgoing_text("hi".into(), None, &[]).encode_to_vec();
+        worker.store_message(failed, Some(raw), None);
+        while events.try_recv().is_ok() {}
+
+        worker
+            .handle_command(Command::Resend {
+                chat: PEER.into(),
+                id: "m".into(),
+            })
+            .await;
+
+        assert_eq!(own_status(&worker, "m"), Delivery::Failed);
+        assert!(
+            events.try_iter().any(
+                |event| matches!(event, Event::Error(error) if error.contains("not sent again"))
+            )
+        );
+    }
+
+    #[test]
+    fn a_receipt_shows_a_message_marked_not_sent_arrived() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let failed = Message {
+            status: Delivery::Failed,
+            ..own_message("m", 1)
+        };
+        worker.store_message(failed, None, None);
+        worker.on_receipt(&receipt(PEER, &["m"], ReceiptType::Delivered));
+        assert_eq!(own_status(&worker, "m"), Delivery::Delivered);
     }
 
     fn receipt(chat: &str, ids: &[&str], kind: ReceiptType) -> wa_events::Receipt {
@@ -22600,6 +22954,34 @@ mod receipt_tests {
     }
 
     #[test]
+    fn history_tells_the_transcript_a_message_marked_not_sent_went_out() {
+        use wa::web_message_info::Status;
+        let (mut worker, events, _inbox, _wa) = worker();
+        let failed = Message {
+            status: Delivery::Failed,
+            ..own_message("m", 100)
+        };
+        worker.store_message(failed, None, None);
+        while events.try_recv().is_ok() {}
+        let mut entry = history_entry(
+            PEER,
+            "m",
+            true,
+            None,
+            wa::Message::text("hi"),
+            Vec::new(),
+            None,
+        );
+        entry.message.as_option_mut().unwrap().status = Some(Status::SERVER_ACK);
+        file_history_entries(&mut worker, vec![entry]);
+        let told = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(event, Event::MessageUpdated(message)
+                if message.id == "m" && message.status == Delivery::Sent)
+        });
+        assert!(told, "the transcript still shows it not sent");
+    }
+
+    #[test]
     fn history_receipts_date_direct_ticks_and_fill_group_message_info() {
         use wa::web_message_info::Status;
         let conversation = |chat: &str, status| {
@@ -23854,6 +24236,120 @@ mod receipt_tests {
                 .timestamp,
             140
         );
+    }
+
+    #[test]
+    fn a_server_ack_files_the_send_before_it_reports() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        worker.store_message(
+            Message {
+                status: Delivery::Pending,
+                ..own_message("mine", 200)
+            },
+            None,
+            None,
+        );
+        let timed = wa_events::ServerAck::builder()
+            .id("mine".to_owned())
+            .class("message".to_owned())
+            .timestamp(whatsapp_rust::wacore::time::from_secs(140).unwrap())
+            .build();
+        worker.server_ack(&timed);
+        assert_eq!(own_status(&worker, "mine"), Delivery::Sent);
+        // A quit before the send reports leaves nothing to mark not sent.
+        assert_eq!(worker.archive.fail_cut_off_sends().expect("cut off"), 0);
+    }
+
+    #[tokio::test]
+    async fn an_error_after_the_server_ack_leaves_the_message_sent() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let pending = Message {
+            status: Delivery::Pending,
+            ..own_message("mine", 200)
+        };
+        worker.store_message(pending, None, None);
+        let timed = wa_events::ServerAck::builder()
+            .id("mine".to_owned())
+            .class("message".to_owned())
+            .timestamp(whatsapp_rust::wacore::time::from_secs(140).unwrap())
+            .build();
+        worker.server_ack(&timed);
+        worker
+            .handle_command(Command::Sent {
+                chat: PEER.into(),
+                id: "mine".into(),
+                error: Some("timed out".into()),
+            })
+            .await;
+
+        // It went out, so it offers no Retry that would move it again.
+        assert_eq!(own_status(&worker, "mine"), Delivery::Sent);
+    }
+
+    #[tokio::test]
+    async fn a_group_receipt_before_a_send_error_leaves_the_message_sent() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let group = "120363000000000001@g.us";
+        let (a, b) = ("a@s.whatsapp.net", "b@s.whatsapp.net");
+        let pending = Message {
+            chat: group.into(),
+            status: Delivery::Pending,
+            ..own_message("mine", 200)
+        };
+        worker.store_message(pending, None, None);
+        let archive = &worker.archive;
+        archive
+            .snapshot_group_recipients(group, "mine", &[a.into(), b.into()])
+            .expect("snapshot");
+        archive
+            .group_receipt(group, "mine", a, Delivery::Delivered, 150)
+            .expect("receipt");
+        worker
+            .handle_command(Command::Sent {
+                chat: group.into(),
+                id: "mine".into(),
+                error: Some("timed out".into()),
+            })
+            .await;
+
+        // a has it, though b's tick is still awaited.
+        let stored = worker.archive.message(group, "mine").expect("read");
+        assert_eq!(stored.expect("stored").status, Delivery::Sent);
+    }
+
+    #[tokio::test]
+    async fn a_closed_window_hears_once_no_send_is_running() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let (done, mut idle) = oneshot::channel();
+        worker.handle_command(Command::SendsFinished(done)).await;
+        assert_eq!(idle.try_recv(), Ok(()), "nothing sending: answered at once");
+
+        let pending = Message {
+            status: Delivery::Pending,
+            ..own_message("mine", 200)
+        };
+        worker.store_message(pending, None, None);
+        let (done, mut waiting) = oneshot::channel();
+        worker.handle_command(Command::SendsFinished(done)).await;
+        assert!(waiting.try_recv().is_err(), "a send is running");
+        worker
+            .handle_command(Command::Sent {
+                chat: PEER.into(),
+                id: "mine".into(),
+                error: None,
+            })
+            .await;
+        worker.settle_send_waiters();
+        assert_eq!(waiting.try_recv(), Ok(()));
+
+        // An attachment still uploading has no message yet.
+        let hold = worker.hold();
+        let (done, mut uploading) = oneshot::channel();
+        worker.handle_command(Command::SendsFinished(done)).await;
+        assert!(uploading.try_recv().is_err(), "an attachment is on its way");
+        drop(hold);
+        worker.settle_send_waiters();
+        assert_eq!(uploading.try_recv(), Ok(()));
     }
 
     #[test]

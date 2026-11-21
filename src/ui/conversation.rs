@@ -57,7 +57,7 @@ const SELECT_GUTTER: f32 = SELECT_BOX + 14.0;
 /// Footer label on an outgoing message that failed to send.
 const NOT_SENT: &str = "Not sent";
 const NOT_SENT_HINT: &str =
-    "This message could not be sent, and ZapFast will not retry it. Send it again yourself.";
+    "This message was not sent. Click Not sent to send it again or to cancel it.";
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let Some(chat) = app.current_chat().cloned() else {
@@ -5691,7 +5691,8 @@ fn bubble_frame(
                 }
             };
             if over_picture && let Some(picture) = slot {
-                footer_over_picture(ui, view, message, picture, starred, pinned, actions);
+                let menu = not_sent_menu_id(&message.chat, &message.id);
+                footer_over_picture(ui, view, message, picture, starred, pinned, menu, actions);
             } else {
                 footer(ui, view, last, slot, starred, pinned, actions);
             }
@@ -6561,6 +6562,8 @@ const OVER_PICTURE_INSET: Vec2 = vec2(10.0, 6.0);
 
 /// Paints the time and ticks over the bottom corner of a picture without a
 /// caption, in white on a soft dark scrim so they read on any picture.
+/// `menu` is the popup a "Not sent" label opens.
+#[allow(clippy::too_many_arguments)]
 fn footer_over_picture(
     ui: &mut egui::Ui,
     view: &View<'_>,
@@ -6568,6 +6571,7 @@ fn footer_over_picture(
     picture: Rect,
     starred: bool,
     pinned: bool,
+    menu: egui::Id,
     actions: &mut Vec<Action>,
 ) {
     let palette = &view.palette;
@@ -6626,16 +6630,7 @@ fn footer_over_picture(
             failed.size(),
         );
         ui.painter().galley(label.min, failed, Color32::WHITE);
-        let status = Rect::from_min_max(label.min, pos2(row.right(), label.max.y));
-        let response = ui.interact(
-            status,
-            ui.id().with(("not-sent", &message.id)),
-            Sense::hover(),
-        );
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Label, true, NOT_SENT_HINT)
-        });
-        response.on_hover_text(NOT_SENT_HINT);
+        not_sent_menu(ui, view, message, label, menu, actions);
     }
     if pinned {
         x -= FOOTER_MARK_SLOT;
@@ -6714,6 +6709,50 @@ fn status_opens_info(
 
 fn not_sent(message: &Message) -> bool {
     message.from_me && message.status == Delivery::Failed
+}
+
+/// The popup a not-sent message's label opens in its bubble's footer. An
+/// album's tile has its own, since the album's last message shows both.
+pub(crate) fn not_sent_menu_id(chat: &str, id: &str) -> egui::Id {
+    egui::Id::new(("not-sent-menu", chat, id))
+}
+
+/// The "Not sent" label explains itself on hover and to screen readers, and
+/// opens Retry and Cancel: send the message again as it was, or delete it,
+/// after the confirmation every deletion asks for. It covers the label
+/// alone, so the ticks beside it still open the message's info.
+fn not_sent_menu(
+    ui: &mut egui::Ui,
+    view: &View<'_>,
+    message: &Message,
+    label: Rect,
+    menu: egui::Id,
+    actions: &mut Vec<Action>,
+) {
+    let response = ui
+        .interact(label, menu.with("label"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, NOT_SENT_HINT));
+    let response = response.on_hover_text(NOT_SENT_HINT);
+    let palette = &view.palette;
+    let retry = crate::i18n::gettext(view.locale, "Retry");
+    let cancel = crate::i18n::gettext(view.locale, "Cancel");
+    egui::Popup::menu(&response)
+        .id(menu)
+        .width(widgets::menu_width(ui, &[&*retry, &*cancel], true))
+        .frame(widgets::menu_frame(palette))
+        .show(|ui| {
+            if widgets::menu_item(ui, palette, Some(Icon::Refresh), &retry) {
+                actions.push(Action::Resend {
+                    chat: message.chat.clone(),
+                    id: message.id.clone(),
+                });
+            }
+            if widgets::menu_item(ui, palette, Some(Icon::X), &cancel) {
+                actions.push(delete_for_me_action(&message.chat, &message.id));
+            }
+        });
 }
 
 /// Paints the time and ticks at the bubble's right edge without widening it.
@@ -6809,18 +6848,8 @@ fn footer(
             failed.size(),
         );
         ui.painter().galley(label.min, failed, palette.text);
-        // Explain on hover and to screen readers; hovering takes no clicks
-        // from the bubble.
-        let status = Rect::from_min_max(label.min, pos2(rect.right(), label.max.y));
-        let response = ui.interact(
-            status,
-            ui.id().with(("not-sent", &message.id)),
-            Sense::hover(),
-        );
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Label, true, NOT_SENT_HINT)
-        });
-        response.on_hover_text(NOT_SENT_HINT);
+        let menu = not_sent_menu_id(&message.chat, &message.id);
+        not_sent_menu(ui, view, message, label, menu, actions);
     }
     if starred {
         x -= FOOTER_MARK_SLOT;
@@ -7026,6 +7055,7 @@ pub(crate) fn menu_width(
 fn message_menu_labels(locale: crate::i18n::Locale) -> Vec<String> {
     use crate::i18n::gettext;
     [
+        gettext(locale, "Retry"),
         gettext(locale, "Reply"),
         gettext(locale, "Reply privately"),
         gettext(locale, "Star"),
@@ -7354,6 +7384,19 @@ fn context_menu(
         first.get_or_insert(response.id);
         response.clicked()
     };
+    // What the "Not sent" label offers, here too for the keyboard.
+    if not_sent(message)
+        && item(
+            ui,
+            Icon::Refresh,
+            &crate::i18n::gettext(view.locale, "Retry"),
+        )
+    {
+        actions.push(Action::Resend {
+            chat: chat.clone(),
+            id: message.id.clone(),
+        });
+    }
     if can_reply(&message.content)
         && item(ui, Icon::Reply, &crate::i18n::gettext(view.locale, "Reply"))
     {
@@ -9126,7 +9169,8 @@ fn album_tile(
         if not_sent(message) {
             let starred = view.starred.is_some_and(|ids| ids.contains(&message.id));
             let pinned = view.pins.is_some_and(|ids| ids.contains(&message.id));
-            footer_over_picture(ui, view, message, rect, starred, pinned, actions);
+            let menu = not_sent_menu_id(&message.chat, &message.id).with("album-tile");
+            footer_over_picture(ui, view, message, rect, starred, pinned, menu, actions);
         }
     }
     // A motion photo in an album keeps its own badge and clip.
@@ -12912,6 +12956,7 @@ mod tests {
                             picture,
                             starred,
                             pinned,
+                            not_sent_menu_id(&message.chat, &message.id),
                             &mut Vec::new(),
                         );
                     },
@@ -13521,8 +13566,19 @@ mod reaction_tests {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("photo.jpg");
         std::fs::write(&file, b"jpeg").unwrap();
+        // A message of ours that was not sent also offers Retry. It stays out
+        // of the shared fixtures until the catalogs translate it.
+        let mut failed = with_reactions(Vec::new());
+        failed.from_me = true;
+        failed.status = Delivery::Failed;
+        let failed = MenuRow {
+            message: failed,
+            marks: Marks { starred: false },
+            pinned: false,
+        };
         let mut labels: Vec<String> = menu_fixtures(&file)
             .iter()
+            .chain([&failed])
             .flat_map(|row| drawn_menu_words(crate::i18n::Locale::English, row))
             .collect();
         // The menu is as wide as the longest label it measures. The

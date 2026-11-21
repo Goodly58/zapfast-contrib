@@ -1082,6 +1082,7 @@ impl Worker {
         };
         let publisher = self.me_name.clone().unwrap_or_default();
         let commands = self.commands.clone();
+        let hold = self.hold();
         let media = self.dirs.media_cache_dir();
         let me = self.me();
         tokio::spawn(async move {
@@ -1098,6 +1099,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: None,
+                        hold,
                     });
                 }
                 Err(error) => {

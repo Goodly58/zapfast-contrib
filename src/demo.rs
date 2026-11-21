@@ -2932,8 +2932,9 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
             }
             "shortcuts" => app.dialog = Some(Dialog::Shortcuts),
             "about" => app.dialog = Some(Dialog::About),
-            "failed" => {
+            "failed" | "failed-menu" => {
                 // The newest outgoing message in the open chat failed to send.
+                // `failed-menu` also opens its Retry and Cancel menu.
                 if let Some(message) = app
                     .open_chat
                     .clone()
@@ -4073,6 +4074,20 @@ fn phone_menu_sample(app: &mut App) {
     row.from_me = false;
     app.open_chat = Some(SAMPLES[0].id.into());
     app.scroll_to_bottom = true;
+}
+
+/// The Retry and Cancel menu of the newest message in the open chat that
+/// was not sent, which `--demo-page failed-menu` opens.
+pub fn not_sent_menu_popup_id(app: &App) -> Option<egui::Id> {
+    let chat = app.open_chat.as_deref()?;
+    let message = app
+        .conversations
+        .get(chat)?
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.from_me && message.status == crate::model::Delivery::Failed)?;
+    Some(crate::ui::conversation::not_sent_menu_id(chat, &message.id))
 }
 
 pub fn phone_menu_popup_id() -> egui::Id {
@@ -9726,6 +9741,7 @@ mod tests {
             "shortcuts",
             "about",
             "failed",
+            "failed-menu",
             "info",
             "info-media",
             "info-docs",
@@ -13543,7 +13559,7 @@ mod tests {
             assert!(
                 nodes
                     .iter()
-                    .any(|(label, _, _)| label.contains("will not retry it"))
+                    .any(|(label, _, _)| label.contains("send it again or to cancel it"))
             );
         }
     }
@@ -20652,10 +20668,72 @@ mod tests {
             .filter(|(_, node)| {
                 node.label()
                     .or_else(|| node.value())
-                    .is_some_and(|label| label.starts_with("This message could not be sent"))
+                    .is_some_and(|label| label.starts_with("This message was not sent"))
             })
             .count();
         assert_eq!(hints, 1, "exactly the failed message carries the hint");
+    }
+
+    /// The "Not sent" label opens Retry and Cancel, and Retry asks for the
+    /// stored message to be sent again.
+    #[test]
+    fn the_not_sent_label_offers_retry_and_cancel() {
+        use egui::accesskit::Role;
+        let mut app = app();
+        app.backend.record_demo_commands();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        app.attach(&ctx);
+        apply_flags(&mut app, Some("failed"));
+        render(&mut app, &ctx);
+        let menu = not_sent_menu_popup_id(&app).expect("a message that was not sent");
+        let nodes = accessible_nodes(&mut app, &ctx, vec![]);
+        let label = nodes
+            .iter()
+            .find(|(label, role, _)| {
+                *role == Role::Button && label.starts_with("This message was not sent")
+            })
+            .expect("the Not sent label is a button")
+            .2;
+        frame_sized(
+            &mut app,
+            &ctx,
+            780.0,
+            vec![egui::Event::PointerMoved(label)],
+        );
+        frame_sized(&mut app, &ctx, 780.0, vec![primary(label, true)]);
+        frame_sized(&mut app, &ctx, 780.0, vec![primary(label, false)]);
+        assert!(egui::Popup::is_id_open(&ctx, menu));
+
+        let nodes = accessible_nodes(&mut app, &ctx, vec![]);
+        assert!(
+            nodes.iter().any(|(label, _, _)| label == "Cancel"),
+            "{nodes:?}"
+        );
+        // As wide as its two labels need, not as wide as the chat.
+        let area = ctx
+            .memory(|memory| memory.area_rect(menu))
+            .expect("the menu is shown");
+        assert!(area.width() < 200.0, "{area:?}");
+        let retry = nodes
+            .iter()
+            .find(|(label, _, _)| label == "Retry")
+            .expect("Retry")
+            .2;
+        frame_sized(
+            &mut app,
+            &ctx,
+            780.0,
+            vec![egui::Event::PointerMoved(retry)],
+        );
+        frame_sized(&mut app, &ctx, 780.0, vec![primary(retry, true)]);
+        frame_sized(&mut app, &ctx, 780.0, vec![primary(retry, false)]);
+        assert!(
+            app.backend
+                .take_demo_commands()
+                .iter()
+                .any(|command| matches!(command, crate::backend::Command::Resend { .. }))
+        );
     }
 
     /// Every control the line under the header draws is reachable without a

@@ -30,6 +30,7 @@ mod receipts;
 mod reconcile;
 #[cfg(test)]
 mod reconcile_tests;
+mod sending;
 mod stars;
 mod stickers;
 pub use polls::PollVote;
@@ -579,6 +580,7 @@ impl Archive {
         connection.execute_batch(favorites::SCHEMA)?;
         connection.execute_batch(stars::SCHEMA)?;
         connection.execute_batch(pins::SCHEMA)?;
+        connection.execute_batch(sending::SCHEMA)?;
         for (table, column, definition) in MIGRATIONS {
             let exists = connection
                 .prepare(&format!("PRAGMA table_info({table})"))?
@@ -1323,6 +1325,8 @@ impl Archive {
             params![lid_chat, phone_chat],
         )?;
         let copies = self.duplicate_copies(&lid_chat, &phone_chat)?;
+        // Of two copies of a message, a failed one gives way to one that was
+        // sent.
         transaction.execute(
             "INSERT INTO messages (chat, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at, history_order, broadcast_list)
              SELECT ?2, id, sender, sender_name, from_me, timestamp, content, status, quoted, reactions, edited, raw, thumbnail, mentions, forwarded, delivered_at, read_at, history_order, broadcast_list
@@ -1331,7 +1335,11 @@ impl Archive {
              ON CONFLICT(chat, id) DO UPDATE SET
                 content = CASE WHEN excluded.edited > messages.edited THEN excluded.content ELSE messages.content END,
                 sender_name = COALESCE(messages.sender_name, excluded.sender_name),
-                status = MAX(messages.status, excluded.status),
+                status = CASE
+                    WHEN messages.status = ?3 AND excluded.status >= ?4 THEN excluded.status
+                    WHEN excluded.status = ?3 AND messages.status >= ?4 THEN messages.status
+                    ELSE MAX(messages.status, excluded.status)
+                END,
                 quoted = COALESCE(messages.quoted, excluded.quoted),
                 reactions = CASE WHEN messages.reactions = '[]' THEN excluded.reactions ELSE messages.reactions END,
                 edited = MAX(messages.edited, excluded.edited),
@@ -1344,9 +1352,15 @@ impl Archive {
                 read_at = COALESCE(messages.read_at, excluded.read_at),
                 history_order = COALESCE(messages.history_order, excluded.history_order),
                 broadcast_list = COALESCE(messages.broadcast_list, excluded.broadcast_list)",
-            params![lid_chat, phone_chat],
+            params![
+                lid_chat,
+                phone_chat,
+                status_rank(Delivery::Failed),
+                status_rank(Delivery::Sent)
+            ],
         )?;
         Self::move_message_metadata(&transaction, &lid_chat, &phone_chat)?;
+        Self::move_sending(&transaction, &lid_chat, &phone_chat)?;
         self.settle_duplicates(&phone_chat, copies, Reactions::Kept)?;
         transaction.execute(
             "INSERT OR IGNORE INTO polls (chat, id, creator, secret) SELECT ?2, id, creator, secret FROM polls WHERE chat = ?1",
@@ -1655,6 +1669,7 @@ impl Archive {
                 sender_name = COALESCE(excluded.sender_name, sender_name),
                 content = excluded.content,
                 status = CASE
+                    WHEN messages.status = ?18 AND excluded.status >= ?20 THEN excluded.status
                     WHEN messages.status > excluded.status AND excluded.status <> ?18
                     THEN messages.status
                     ELSE excluded.status
@@ -1695,6 +1710,8 @@ impl Archive {
                 // An explicit failure still writes over a further state.
                 status_rank(Delivery::Failed),
                 message.history_order,
+                // A copy that was sent moves a failed message on.
+                status_rank(Delivery::Sent),
             ],
         )?;
         if matches!(message.content, Content::Image { motion: None, .. }) {
@@ -2632,9 +2649,12 @@ impl Archive {
     }
 
     /// Advances delivery state, except that `Failed` may replace it. Stores the
-    /// first timestamp for each delivery stage.
+    /// first timestamp for each delivery stage. Being sent or a receipt also
+    /// moves a failed message on: it proves the message went out after all.
     pub fn set_status(&self, chat: &str, id: &str, status: Delivery, at: i64) -> Result<bool> {
         let rank = status_rank(status);
+        let failed = status_rank(Delivery::Failed);
+        let advances = status >= Delivery::Sent;
         let changed = if status == Delivery::Failed {
             self.connection.execute(
                 "UPDATE messages SET status = ?3 WHERE chat = ?1 AND id = ?2",
@@ -2644,14 +2664,15 @@ impl Archive {
             self.connection.execute(
                 &format!(
                     "UPDATE messages SET status = ?3, {column} = COALESCE({column}, ?4)
-                     WHERE chat = ?1 AND id = ?2 AND status < ?3"
+                     WHERE chat = ?1 AND id = ?2 AND (status < ?3 OR (?6 AND status = ?5))"
                 ),
-                params![chat, id, rank, at],
+                params![chat, id, rank, at, failed, advances],
             )?
         } else {
             self.connection.execute(
-                "UPDATE messages SET status = ?3 WHERE chat = ?1 AND id = ?2 AND status < ?3",
-                params![chat, id, rank],
+                "UPDATE messages SET status = ?3
+                 WHERE chat = ?1 AND id = ?2 AND (status < ?3 OR (?5 AND status = ?4))",
+                params![chat, id, rank, failed, advances],
             )?
         };
         Ok(changed > 0)
@@ -2958,13 +2979,33 @@ impl Archive {
     /// Clears all archived data during unlinking.
     pub fn clear(&self) -> Result<()> {
         self.connection.execute_batch(
-            "DELETE FROM poll_history; DELETE FROM poll_votes; DELETE FROM polls; DELETE FROM group_receipts; DELETE FROM messages; DELETE FROM stars; DELETE FROM motion_clips; DELETE FROM chats; DELETE FROM chat_removals; DELETE FROM message_removals; DELETE FROM pending_message_removals; DELETE FROM contacts; DELETE FROM meta; DELETE FROM lids; DELETE FROM drafts; DELETE FROM local_chat_labels; DELETE FROM local_labels; DELETE FROM removed_recent_stickers; DELETE FROM favorite_stickers; DELETE FROM favorites; DELETE FROM favorite_changes;",
+            "DELETE FROM poll_history; DELETE FROM poll_votes; DELETE FROM polls; DELETE FROM group_receipts; DELETE FROM messages; DELETE FROM stars; DELETE FROM motion_clips; DELETE FROM chats; DELETE FROM chat_removals; DELETE FROM message_removals; DELETE FROM pending_message_removals; DELETE FROM contacts; DELETE FROM meta; DELETE FROM lids; DELETE FROM drafts; DELETE FROM local_chat_labels; DELETE FROM local_labels; DELETE FROM removed_recent_stickers; DELETE FROM favorite_stickers; DELETE FROM favorites; DELETE FROM favorite_changes; DELETE FROM sending;",
         )
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// Makes changing the status of message `id` fail, as a full disk would,
+    /// until [`accept_status`].
+    pub(crate) fn reject_status(archive: &super::Archive, id: &str) {
+        archive
+            .connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_status BEFORE UPDATE OF status ON messages WHEN NEW.id = '{id}'
+                 BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;"
+            ))
+            .unwrap();
+    }
+
+    /// Undoes [`reject_status`].
+    pub(crate) fn accept_status(archive: &super::Archive) {
+        archive
+            .connection
+            .execute_batch("DROP TRIGGER reject_status;")
+            .unwrap();
+    }
+
     /// Makes filing the message `id` fail, as a full disk would.
     pub(crate) fn reject_message(archive: &super::Archive, id: &str) {
         archive
