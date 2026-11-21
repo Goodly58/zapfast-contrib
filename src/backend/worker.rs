@@ -1101,7 +1101,7 @@ pub async fn run(
         awaiting_ack: HashMap::new(),
         send_turns: HashMap::new(),
         send_waiters: Vec::new(),
-        staging: Arc::new(()),
+        send_holds: Arc::new(()),
         receipts_watch: None,
         receipts_pruned: Instant::now(),
         early: Default::default(),
@@ -1547,9 +1547,9 @@ struct Worker {
     send_turns: HashMap<ChatId, oneshot::Receiver<()>>,
     /// Closed windows waiting for this account's sends to finish.
     send_waiters: Vec<oneshot::Sender<()>>,
-    /// Shared with each attachment still staged (see `Staged`), so more than
-    /// one holder means one is.
-    staging: Arc<()>,
+    /// Shared with each `SendHold`, so more than one holder means an
+    /// attachment is still on its way.
+    send_holds: Arc<()>,
     /// The group message whose "Message info" is open.
     receipts_watch: Option<(ChatId, String)>,
     /// When receipts that never found their message were last dropped.
@@ -7761,12 +7761,12 @@ impl Worker {
                 row,
                 raw,
                 turn,
-                staged,
+                hold,
             } => {
                 self.outbound(chat, *row, raw, turn);
                 // Archived with the note of its send by now, which a closed
                 // window waits on from here.
-                drop(staged);
+                drop(hold);
             }
             Command::SendSticker {
                 chat,
@@ -9872,13 +9872,13 @@ impl Worker {
     }
 
     /// Answers the closed windows waiting for this account's sends once
-    /// none is running: no attachment is staged, and no message noted as
+    /// none is running: no attachment is on its way, and no message noted as
     /// sending is still pending. A note that cannot be read holds nothing
     /// up: quitting must not wait on the archive.
     fn settle_send_waiters(&mut self) {
         self.send_waiters.retain(|done| !done.is_closed());
         if self.send_waiters.is_empty()
-            || Arc::strong_count(&self.staging) > 1
+            || Arc::strong_count(&self.send_holds) > 1
             || self.archive.sends_running().unwrap_or(false)
         {
             return;
@@ -9888,9 +9888,12 @@ impl Worker {
         }
     }
 
-    /// Notes an attachment accepted for sending until it is archived.
-    fn stage(&self) -> super::Staged {
-        super::Staged(Arc::clone(&self.staging))
+    /// Holds the place of an attachment accepted for sending until it is
+    /// archived.
+    fn hold(&self) -> super::SendHold {
+        super::SendHold {
+            _shared: Arc::clone(&self.send_holds),
+        }
     }
 
     /// Whether the server acknowledged a message of ours, or a receipt or a
@@ -11729,7 +11732,7 @@ impl Worker {
             // Like the caption, the reply belongs to the first file.
             let quote = quote.take();
             let commands = self.commands.clone();
-            let staged = self.stage();
+            let hold = self.hold();
             let chat = chat.clone();
             let dir = self.dirs.media_cache_dir();
             let me = self.me();
@@ -11809,7 +11812,7 @@ impl Worker {
                             row: Box::new(row),
                             raw,
                             turn: Some(turn),
-                            staged,
+                            hold,
                         });
                     }
                     // Cancelled on purpose: nothing to tell.
@@ -11866,7 +11869,7 @@ impl Worker {
         }
         let (previous, turn) = self.send_turn(&chat);
         let commands = self.commands.clone();
-        let staged = self.stage();
+        let hold = self.hold();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         // A pasted picture has no name; the strip calls it a picture.
@@ -11920,7 +11923,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: Some(turn),
-                        staged,
+                        hold,
                     });
                 }
                 Err(_) if uploading.cancelled() => {}
@@ -11955,7 +11958,7 @@ impl Worker {
             return;
         };
         let commands = self.commands.clone();
-        let staged = self.stage();
+        let hold = self.hold();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         tokio::spawn(async move {
@@ -11983,7 +11986,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: None,
-                        staged,
+                        hold,
                     });
                 }
                 Err(error) => {
@@ -12049,7 +12052,7 @@ impl Worker {
             return;
         };
         let commands = self.commands.clone();
-        let staged = self.stage();
+        let hold = self.hold();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         tokio::spawn(async move {
@@ -12068,7 +12071,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: None,
-                        staged,
+                        hold,
                     });
                 }
                 Err(error) => {
@@ -12096,7 +12099,7 @@ impl Worker {
             return;
         };
         let commands = self.commands.clone();
-        let staged = self.stage();
+        let hold = self.hold();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         tokio::spawn(async move {
@@ -12131,7 +12134,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: None,
-                        staged,
+                        hold,
                     });
                 }
                 Err(error) => {
@@ -20649,7 +20652,7 @@ mod receipt_tests {
             awaiting_ack: HashMap::new(),
             send_turns: HashMap::new(),
             send_waiters: Vec::new(),
-            staging: Arc::new(()),
+            send_holds: Arc::new(()),
             receipts_watch: None,
             receipts_pruned: Instant::now(),
             early: Default::default(),
@@ -24340,11 +24343,11 @@ mod receipt_tests {
         assert_eq!(waiting.try_recv(), Ok(()));
 
         // An attachment still uploading has no message yet.
-        let staged = worker.stage();
+        let hold = worker.hold();
         let (done, mut uploading) = oneshot::channel();
         worker.handle_command(Command::SendsFinished(done)).await;
-        assert!(uploading.try_recv().is_err(), "an attachment is staged");
-        drop(staged);
+        assert!(uploading.try_recv().is_err(), "an attachment is on its way");
+        drop(hold);
         worker.settle_send_waiters();
         assert_eq!(uploading.try_recv(), Ok(()));
     }
