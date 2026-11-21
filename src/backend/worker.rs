@@ -1101,6 +1101,7 @@ pub async fn run(
         awaiting_ack: HashMap::new(),
         send_turns: HashMap::new(),
         send_waiters: Vec::new(),
+        staging: Arc::new(()),
         receipts_watch: None,
         receipts_pruned: Instant::now(),
         early: Default::default(),
@@ -1546,6 +1547,9 @@ struct Worker {
     send_turns: HashMap<ChatId, oneshot::Receiver<()>>,
     /// Closed windows waiting for this account's sends to finish.
     send_waiters: Vec<oneshot::Sender<()>>,
+    /// Shared with each attachment still staged (see `Staged`), so more than
+    /// one holder means one is.
+    staging: Arc<()>,
     /// The group message whose "Message info" is open.
     receipts_watch: Option<(ChatId, String)>,
     /// When receipts that never found their message were last dropped.
@@ -7757,7 +7761,13 @@ impl Worker {
                 row,
                 raw,
                 turn,
-            } => self.outbound(chat, *row, raw, turn),
+                staged,
+            } => {
+                self.outbound(chat, *row, raw, turn);
+                // Archived with the note of its send by now, which a closed
+                // window waits on from here.
+                drop(staged);
+            }
             Command::SendSticker {
                 chat,
                 path,
@@ -9862,16 +9872,25 @@ impl Worker {
     }
 
     /// Answers the closed windows waiting for this account's sends once
-    /// none is running. A note that cannot be read holds nothing up:
-    /// quitting must not wait on the archive.
+    /// none is running: no attachment is staged, and no message noted as
+    /// sending is still pending. A note that cannot be read holds nothing
+    /// up: quitting must not wait on the archive.
     fn settle_send_waiters(&mut self) {
         self.send_waiters.retain(|done| !done.is_closed());
-        if self.send_waiters.is_empty() || self.archive.sends_running().unwrap_or(false) {
+        if self.send_waiters.is_empty()
+            || Arc::strong_count(&self.staging) > 1
+            || self.archive.sends_running().unwrap_or(false)
+        {
             return;
         }
         for done in self.send_waiters.drain(..) {
             let _ = done.send(());
         }
+    }
+
+    /// Notes an attachment accepted for sending until it is archived.
+    fn stage(&self) -> super::Staged {
+        super::Staged(Arc::clone(&self.staging))
     }
 
     /// Whether the server acknowledged a message of ours, or a receipt or a
@@ -11710,6 +11729,7 @@ impl Worker {
             // Like the caption, the reply belongs to the first file.
             let quote = quote.take();
             let commands = self.commands.clone();
+            let staged = self.stage();
             let chat = chat.clone();
             let dir = self.dirs.media_cache_dir();
             let me = self.me();
@@ -11789,6 +11809,7 @@ impl Worker {
                             row: Box::new(row),
                             raw,
                             turn: Some(turn),
+                            staged,
                         });
                     }
                     // Cancelled on purpose: nothing to tell.
@@ -11845,6 +11866,7 @@ impl Worker {
         }
         let (previous, turn) = self.send_turn(&chat);
         let commands = self.commands.clone();
+        let staged = self.stage();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         // A pasted picture has no name; the strip calls it a picture.
@@ -11898,6 +11920,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: Some(turn),
+                        staged,
                     });
                 }
                 Err(_) if uploading.cancelled() => {}
@@ -11932,6 +11955,7 @@ impl Worker {
             return;
         };
         let commands = self.commands.clone();
+        let staged = self.stage();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         tokio::spawn(async move {
@@ -11959,6 +11983,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: None,
+                        staged,
                     });
                 }
                 Err(error) => {
@@ -12024,6 +12049,7 @@ impl Worker {
             return;
         };
         let commands = self.commands.clone();
+        let staged = self.stage();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         tokio::spawn(async move {
@@ -12042,6 +12068,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: None,
+                        staged,
                     });
                 }
                 Err(error) => {
@@ -12069,6 +12096,7 @@ impl Worker {
             return;
         };
         let commands = self.commands.clone();
+        let staged = self.stage();
         let dir = self.dirs.media_cache_dir();
         let me = self.me();
         tokio::spawn(async move {
@@ -12103,6 +12131,7 @@ impl Worker {
                         row: Box::new(row),
                         raw,
                         turn: None,
+                        staged,
                     });
                 }
                 Err(error) => {
@@ -20620,6 +20649,7 @@ mod receipt_tests {
             awaiting_ack: HashMap::new(),
             send_turns: HashMap::new(),
             send_waiters: Vec::new(),
+            staging: Arc::new(()),
             receipts_watch: None,
             receipts_pruned: Instant::now(),
             early: Default::default(),
@@ -24308,6 +24338,15 @@ mod receipt_tests {
             .await;
         worker.settle_send_waiters();
         assert_eq!(waiting.try_recv(), Ok(()));
+
+        // An attachment still uploading has no message yet.
+        let staged = worker.stage();
+        let (done, mut uploading) = oneshot::channel();
+        worker.handle_command(Command::SendsFinished(done)).await;
+        assert!(uploading.try_recv().is_err(), "an attachment is staged");
+        drop(staged);
+        worker.settle_send_waiters();
+        assert_eq!(uploading.try_recv(), Ok(()));
     }
 
     #[test]

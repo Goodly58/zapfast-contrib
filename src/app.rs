@@ -1246,9 +1246,6 @@ impl fastframe_shell::Resident for App {
         if self.quit_requested {
             fastframe_shell::Headless::Quit
         } else if self.wants_show {
-            // Launched again while closing: the window is back, and closing
-            // it again waits again.
-            self.closing = None;
             fastframe_shell::Headless::Show
         } else if self.closing_done(Instant::now()) {
             fastframe_shell::Headless::Quit
@@ -2751,6 +2748,9 @@ impl App {
 
     /// Initializes a newly created window.
     pub fn attach(&mut self, ctx: &egui::Context) {
+        // A window is open again, shown or replacing the last one: closing it
+        // waits for the sends afresh.
+        self.closing = None;
         // Texture handles belong to the window's egui context. Keep the
         // underlying pictures and recreate handles for the new window.
         self.call_local_texture = None;
@@ -18270,10 +18270,13 @@ mod tests {
             "a worker that stopped is sending nothing"
         );
 
+        // The shell attaches every window it opens, whether shown again or
+        // replacing the one closed in the same frame.
         let mut app = self::app();
         let _done = close(&mut app);
         app.wants_show = true;
         assert_eq!(app.headless_frame(&ctx), Headless::Show);
+        app.attach(&ctx);
         assert!(app.closing.is_none(), "launched again: not quitting");
 
         let (_done, finished) = tokio::sync::oneshot::channel();

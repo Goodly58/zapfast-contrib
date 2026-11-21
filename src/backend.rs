@@ -160,6 +160,12 @@ pub struct SendTurn {
     pub gate: crate::model::UploadGate,
 }
 
+/// An attachment the worker accepted and has not archived yet: it is being
+/// prepared or uploaded, or waits for the one before it. A closed window
+/// waits while any is held, since nothing would show it was cut off.
+#[derive(Debug)]
+pub struct Staged(std::sync::Arc<()>);
+
 #[derive(Debug)]
 pub enum Command {
     FetchBlocklist,
@@ -1104,6 +1110,8 @@ pub enum Command {
         /// Its place in the chat's line, for an attachment that waits for the
         /// one staged before it.
         turn: Option<SendTurn>,
+        /// Held until the worker has archived it.
+        staged: Staged,
     },
     /// Phone numbers a group's metadata named, as (privacy id, number).
     LearnNumbers(Vec<(String, String)>),
