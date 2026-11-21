@@ -42,6 +42,20 @@ impl Archive {
         Ok(())
     }
 
+    /// Whether a send of ours is still running: a message noted as sending
+    /// that is still pending. A send that failed some other way can leave
+    /// its note until the next start, but is not running.
+    pub fn sends_running(&self) -> Result<bool> {
+        let running = self.connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sending JOIN messages
+                 ON messages.chat = sending.chat AND messages.id = sending.id
+                 WHERE messages.status = ?1)",
+            params![status_rank(Delivery::Pending)],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(running)
+    }
+
     /// Marks our messages whose send was cut off as failed, and returns how
     /// many there were. Only for startup, while no send can be running.
     ///
@@ -290,5 +304,27 @@ mod tests {
         archive.insert_message(&incoming, None).expect("insert");
         assert!(!archive.retry_send(GROUP, "in").expect("retry"));
         assert!(!archive.retry_send(GROUP, "missing").expect("retry"));
+    }
+
+    #[test]
+    fn only_a_noted_message_still_pending_is_sending() {
+        let archive = Archive::in_memory().expect("opens");
+        assert!(!archive.sends_running().expect("read"), "nothing noted");
+        archive
+            .insert_sending(&message(GROUP, "m", 100, true), None)
+            .expect("insert");
+        assert!(archive.sends_running().expect("read"));
+        archive
+            .set_status(GROUP, "m", Delivery::Failed, 101)
+            .expect("failed");
+        assert!(
+            !archive.sends_running().expect("read"),
+            "a send that failed without reporting is not running"
+        );
+        archive
+            .insert_sending(&message(GROUP, "n", 102, true), None)
+            .expect("insert");
+        archive.sending_finished(GROUP, "n").expect("done");
+        assert!(!archive.sends_running().expect("read"), "a finished send");
     }
 }

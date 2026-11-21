@@ -1100,6 +1100,7 @@ pub async fn run(
         interactive_sending: HashMap::new(),
         awaiting_ack: HashMap::new(),
         send_turns: HashMap::new(),
+        send_waiters: Vec::new(),
         receipts_watch: None,
         receipts_pruned: Instant::now(),
         early: Default::default(),
@@ -1228,6 +1229,8 @@ pub async fn run(
                 worker.reconcile_call().await;
             }
         }
+        // A send finishes on a command or an event: tell a closed window.
+        worker.settle_send_waiters();
     }
     worker.stop_chat_export().await;
     worker.shutdown_call().await;
@@ -1541,6 +1544,8 @@ struct Worker {
     awaiting_ack: HashMap<String, AwaitingAck>,
     /// Per chat, resolved when the attachment queued last has gone out.
     send_turns: HashMap<ChatId, oneshot::Receiver<()>>,
+    /// Closed windows waiting for this account's sends to finish.
+    send_waiters: Vec<oneshot::Sender<()>>,
     /// The group message whose "Message info" is open.
     receipts_watch: Option<(ChatId, String)>,
     /// When receipts that never found their message were last dropped.
@@ -9043,6 +9048,10 @@ impl Worker {
                 self.start_bot().await;
             }
             Command::Shutdown => {}
+            Command::SendsFinished(done) => {
+                self.send_waiters.push(done);
+                self.settle_send_waiters();
+            }
             Command::OlderSent {
                 chat,
                 serial,
@@ -9850,6 +9859,19 @@ impl Worker {
             expiration,
             None,
         ));
+    }
+
+    /// Answers the closed windows waiting for this account's sends once
+    /// none is running. A note that cannot be read holds nothing up:
+    /// quitting must not wait on the archive.
+    fn settle_send_waiters(&mut self) {
+        self.send_waiters.retain(|done| !done.is_closed());
+        if self.send_waiters.is_empty() || self.archive.sends_running().unwrap_or(false) {
+            return;
+        }
+        for done in self.send_waiters.drain(..) {
+            let _ = done.send(());
+        }
     }
 
     /// Whether the server acknowledged a message of ours, or a receipt or a
@@ -20597,6 +20619,7 @@ mod receipt_tests {
             interactive_sending: HashMap::new(),
             awaiting_ack: HashMap::new(),
             send_turns: HashMap::new(),
+            send_waiters: Vec::new(),
             receipts_watch: None,
             receipts_pruned: Instant::now(),
             early: Default::default(),
@@ -24259,6 +24282,32 @@ mod receipt_tests {
         // a has it, though b's tick is still awaited.
         let stored = worker.archive.message(group, "mine").expect("read");
         assert_eq!(stored.expect("stored").status, Delivery::Sent);
+    }
+
+    #[tokio::test]
+    async fn a_closed_window_hears_once_no_send_is_running() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let (done, mut idle) = oneshot::channel();
+        worker.handle_command(Command::SendsFinished(done)).await;
+        assert_eq!(idle.try_recv(), Ok(()), "nothing sending: answered at once");
+
+        let pending = Message {
+            status: Delivery::Pending,
+            ..own_message("mine", 200)
+        };
+        worker.store_message(pending, None, None);
+        let (done, mut waiting) = oneshot::channel();
+        worker.handle_command(Command::SendsFinished(done)).await;
+        assert!(waiting.try_recv().is_err(), "a send is running");
+        worker
+            .handle_command(Command::Sent {
+                chat: PEER.into(),
+                id: "mine".into(),
+                error: None,
+            })
+            .await;
+        worker.settle_send_waiters();
+        assert_eq!(waiting.try_recv(), Ok(()));
     }
 
     #[test]

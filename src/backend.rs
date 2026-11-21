@@ -1017,6 +1017,9 @@ pub enum Command {
     /// Whether the person is looking at ZapFast. While they are not, the
     /// linked phone keeps receiving push notifications.
     SetOnline(bool),
+    /// Answers once none of the account's messages is still sending, so a
+    /// closed window can let a send finish before ZapFast quits.
+    SendsFinished(tokio::sync::oneshot::Sender<()>),
     Shutdown,
     /// Internal send result.
     Sent {
